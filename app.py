@@ -90,8 +90,11 @@ if uploaded_file:
         # 2D GRID ANZEIGE (2 x 3)
         st.subheader("2D Analyse-Modelle")
         plots = [
-            ("NW Hillshade", nw_hill, "gist_gray"),
-            ("MDS Composite", mds, "gist_gray"),
-            ("Final Composite", comp, "gist_gray"),
-            ("Restrelief (LRM)", lrm, "RdBu"),
-            ("Lokale Krümmung", curv, "RdYlGn"),
+    ("NW Hillshade", nw_hill, "gist_gray"),
+    ("MDS Composite", mds, "gist_gray"),
+    ("Final Composite", comp, "gist_gray"),
+    ("Restrelief (LRM)", lrm, "RdBu"),
+    ("Lokale Krümmung", curv, "RdYlGn"),
+    ("Hangneigung (Slope)", slope, "plasma")
+#
+
