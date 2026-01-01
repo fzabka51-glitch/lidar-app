@@ -102,7 +102,7 @@ if uploaded_file:
             # Reinigung wie im Colab sanitize_data_for_plotly
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
-            # Alle Modelle berechnen (wie im Colab Schritt 6)
+            # Alle Modelle berechnen
             nw_h = calculate_hillshade(gz, 315, 45, grid_res)
             mds = calculate_multi_hillshade(gz, grid_res)
             lrm = calculate_lrm(gz, lrm_sigma)
@@ -111,13 +111,13 @@ if uploaded_file:
             # Fusion
             comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
 
-            # Dictionary für die Auswahl (Analog zu Colab texture_data)
+            # Dictionary für die Auswahl (Namen kleingeschrieben für Matplotlib Kompatibilität)
             analysis_models = {
-                "Final Composite (Fusion)": (comp, "Greys", False),
-                "NW Hillshade": (nw_h, "Greys", False),
-                "MDS Composite": (mds, "Greys", False),
+                "Final Composite (Fusion)": (comp, "gray", False),
+                "NW Hillshade": (nw_h, "gray", False),
+                "MDS Composite": (mds, "gray", False),
                 "Restrelief (LRM)": (lrm, "RdBu", True),
-                "Hangneigung (Slope)": (slope, "Plasma", True),
+                "Hangneigung (Slope)": (slope, "plasma", True),
                 "Krümmung (Curvature)": (curv, "RdYlGn", True)
             }
 
@@ -130,23 +130,24 @@ if uploaded_file:
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
                         fig, ax = plt.subplots()
-                        ax.imshow(data, cmap=cmap if cmap != "Greys" else "gray")
+                        ax.imshow(data, cmap=cmap)
                         ax.set_title(name)
                         ax.axis('off')
                         st.pyplot(fig)
+                        plt.close(fig)
             else:
                 sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
                 data, cmap, _ = analysis_models[sel_2d]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap if cmap != "Greys" else "gray")
+                ax.imshow(data, cmap=cmap)
                 ax.axis('off')
                 st.pyplot(fig)
+                plt.close(fig)
 
         # TAB 2: 3D (DER VERBESSERTE COLAB-VIEWER)
         with tab2:
             st.subheader("Interaktiver 3D-Viewer")
             
-            # Auswahl der Textur (Das hat gefehlt!)
             selected_texture = st.selectbox(
                 "Wähle Analyse-Ebene für die 3D-Oberfläche:", 
                 list(analysis_models.keys()),
@@ -155,8 +156,7 @@ if uploaded_file:
             
             tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
             
-            # Downsampling für flüssige 3D-Rotation (wie im Colab)
-            # Wir zielen auf ca. 150k Punkte für flüssige Performance im Browser
+            # Downsampling für flüssige 3D-Rotation
             step = max(1, int(np.sqrt(gz.size / 150000)))
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
@@ -170,10 +170,9 @@ if uploaded_file:
                 lightposition=dict(x=100, y=100, z=1000)
             )])
             
-            # Layout-Anpassung exakt nach Colab-Vorbild
             fig3d.update_layout(
                 scene=dict(
-                    aspectmode='data', # Bezieht sich auf die tatsächlichen Koordinaten-Dimensionen
+                    aspectmode='data',
                     aspectratio=dict(x=1, y=1, z=z_exag),
                     xaxis=dict(visible=False),
                     yaxis=dict(visible=False),
