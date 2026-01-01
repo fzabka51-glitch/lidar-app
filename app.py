@@ -78,11 +78,11 @@ with st.sidebar:
     uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
     st.subheader("Raster & Filter")
-    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
+    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0, help="Niedrigerer Wert = Höhere Schärfe (z.B. 0.5m)")
     lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
     
     st.subheader("3D-Eigenschaften")
-    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1, help="Colab Standard war oft 0.3-0.5 relativ zur Fläche.")
+    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
     
     st.subheader("Anzeige")
     view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
@@ -99,7 +99,7 @@ if uploaded_file:
         # 2. Berechnungen
         with st.spinner("Analysiere Gelände..."):
             gz = rasterize_points(df, grid_res)
-            # Reinigung wie im Colab sanitize_data_for_plotly
+            # Reinigung
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
             # Alle Modelle berechnen
@@ -111,7 +111,6 @@ if uploaded_file:
             # Fusion
             comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
 
-            # Dictionary für die Auswahl (Namen kleingeschrieben für Matplotlib Kompatibilität)
             analysis_models = {
                 "Final Composite (Fusion)": (comp, "gray", False),
                 "NW Hillshade": (nw_h, "gray", False),
@@ -130,7 +129,8 @@ if uploaded_file:
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
                         fig, ax = plt.subplots()
-                        ax.imshow(data, cmap=cmap)
+                        # 'none' interpolation verhindert Verschwimmen in Matplotlib
+                        ax.imshow(data, cmap=cmap, interpolation='none')
                         ax.set_title(name)
                         ax.axis('off')
                         st.pyplot(fig)
@@ -139,12 +139,12 @@ if uploaded_file:
                 sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
                 data, cmap, _ = analysis_models[sel_2d]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap)
+                ax.imshow(data, cmap=cmap, interpolation='none')
                 ax.axis('off')
                 st.pyplot(fig)
                 plt.close(fig)
 
-        # TAB 2: 3D (DER VERBESSERTE COLAB-VIEWER)
+        # TAB 2: 3D
         with tab2:
             st.subheader("Interaktiver 3D-Viewer")
             
@@ -156,8 +156,8 @@ if uploaded_file:
             
             tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
             
-            # Downsampling für flüssige 3D-Rotation
-            step = max(1, int(np.sqrt(gz.size / 150000)))
+            # Schärfere Einstellung: Erhöhung des Limits auf 400.000 Punkte
+            step = max(1, int(np.sqrt(gz.size / 400000)))
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
 
@@ -166,7 +166,7 @@ if uploaded_file:
                 surfacecolor=surface_tex, 
                 colorscale=tex_cmap,
                 showscale=show_scale,
-                lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.7),
+                lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
                 lightposition=dict(x=100, y=100, z=1000)
             )])
             
@@ -184,7 +184,7 @@ if uploaded_file:
             )
             
             st.plotly_chart(fig3d, use_container_width=True)
-            st.info("💡 Tipp: Wähle 'Restrelief (LRM)' oder 'Slope', um die archäologischen Details im 3D-Modell farblich hervorzuheben.")
+            st.info("💡 Pro-Tipp für Schärfe: Auflösung in Sidebar auf 0.5m stellen und Z-Überhöhung auf ca. 1.0 erhöhen.")
 
     except Exception as e:
         st.error(f"Fehler: {e}")
