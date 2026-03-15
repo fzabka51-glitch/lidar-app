@@ -7,3 +7,4 @@ datashader
 rasterio
 cupy-cuda12x
 scipy
+pyproj
