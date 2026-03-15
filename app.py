@@ -6,8 +6,15 @@ import plotly.graph_objects as go
 import plotly.express as px
 from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
-import pyproj
+import io
 from datetime import datetime
+
+# Versuche pyproj zu importieren (für Koordinatenumrechnung)
+try:
+    import pyproj
+    PYPROJ_AVAILABLE = True
+except ImportError:
+    PYPROJ_AVAILABLE = False
 
 # --- SEITENKONFIGURATION ---
 st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide", page_icon="🏛️")
@@ -27,6 +34,8 @@ def convert_coords(x, y, from_epsg=25832):
     Wandelt Koordinaten um (Standard: UTM Zone 32N - oft für DE LiDAR genutzt).
     Gibt Lat/Lon für Google Maps zurück.
     """
+    if not PYPROJ_AVAILABLE:
+        return None, None
     try:
         transformer = pyproj.Transformer.from_crs(f"epsg:{from_epsg}", "epsg:4326", always_xy=True)
         lon, lat = transformer.transform(x, y)
@@ -73,8 +82,8 @@ with st.sidebar:
     grid_res = st.slider("Raster-Auflösung (m)", 0.2, 5.0, 1.0)
     z_exag = st.slider("3D Überhöhung", 0.5, 5.0, 1.5)
     
-    if uploaded_file:
-        st.success("Datei bereit!")
+    if not PYPROJ_AVAILABLE:
+        st.warning("⚠️ 'pyproj' ist nicht installiert. Koordinatenumrechnung deaktiviert.")
 
 # --- HAUPTBEREICH ---
 st.title("🏛️ LiDAR Archäologie & Gelände-Analyse")
@@ -96,6 +105,8 @@ if uploaded_file:
     if lat and lon:
         google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
         m4.markdown(f"**📍 Standort**\n\n[{lat:.5f}, {lon:.5f}]({google_maps_url})")
+    else:
+        m4.write("📍 Standort-Info N/A")
     
     # 2. Prozessierung
     with st.spinner("Generiere Geländemodelle..."):
@@ -144,7 +155,7 @@ if uploaded_file:
             st.map(map_df)
             st.info(f"Zentrum der Punktwolke (EPSG:{epsg_code}): X={center_x:.2f}, Y={center_y:.2f}")
         else:
-            st.warning("Keine gültigen Geo-Koordinaten gefunden. Bitte EPSG-Code prüfen.")
+            st.warning("Keine geografischen Informationen verfügbar. Stelle sicher, dass 'pyproj' installiert ist und die Koordinaten metrisch sind.")
 
     # Export
     st.divider()
@@ -159,8 +170,7 @@ else:
     st.info("👋 Willkommen! Bitte lade eine .xyz Datei hoch, um mit der archäologischen Analyse zu beginnen.")
     st.markdown("""
     ### Features dieser Version:
-    - **Automatische Geo-Links:** Erzeugt Google Maps Links aus UTM-Koordinaten.
-    - **LRM-Filter:** Macht kleinste Bodenstrukturen (Wälle, Gräben) sichtbar.
-    - **Interaktives 2D:** Zoombar mittels Plotly.
-    - **Performance:** Nutzt Datashader für schnelle Rasterisierung.
+    - **Interaktives 2D & 3D:** Hochauflösende Analyse direkt im Browser.
+    - **Archäologische Spezial-Filter:** LRM zur Erkennung kleinster Bodenstrukturen.
+    - **Google Maps Anbindung:** Automatische Verlinkung bei korrekten Koordinaten.
     """)
