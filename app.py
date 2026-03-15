@@ -160,7 +160,7 @@ if uploaded_file:
                 "Krümmung (Curvature)": (curv, "RdYlGn", True)
             }
 
-        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion (Interaktiv)"])
+        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion"])
 
         # TAB 1: 2D
         with tab1:
@@ -185,8 +185,7 @@ if uploaded_file:
 
         # TAB 2: 3D
         with tab2:
-            st.subheader("Interaktiver 3D-Viewer")
-            st.caption("Verwende das 'Box Select' oder 'Lasso Select' Werkzeug oben rechts im Viewer, um einen Punkt zu markieren und die Koordinaten zu erhalten.")
+            st.subheader("3D-Viewer")
             
             selected_texture = st.selectbox(
                 "Wähle Analyse-Ebene für die 3D-Oberfläche:", 
@@ -214,7 +213,6 @@ if uploaded_file:
                 showscale=show_scale,
                 lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
                 lightposition=dict(x=100, y=100, z=1000),
-                customdata=np.stack((z_plot,), axis=-1),
                 hovertemplate='X: %{x:.2f}<br>Y: %{y:.2f}<br>Höhe: %{z:.2f}m<extra></extra>'
             )])
             
@@ -228,17 +226,10 @@ if uploaded_file:
                 ),
                 height=800,
                 margin=dict(l=0, r=0, b=0, t=40),
-                title=f"3D Ansicht: {selected_texture}",
-                clickmode='event+select'
+                title=f"3D Ansicht: {selected_texture}"
             )
             
-            # Standard Streamlit Plotly Chart mit Selektions-Event
-            event = st.plotly_chart(fig3d, use_container_width=True, on_select="rerun")
-
-            # Da 3D-Surfaces in Plotly kein direktes 'on_select' wie Scatterplots unterstützen,
-            # nutzen wir hier die Hover-Information oder die Zentrumsanzeige.
-            # Um den Klick zu simulieren, zeigen wir die Koordinaten im Tooltip an.
-            st.info("ℹ️ Da 3D-Oberflächen keine Punkt-Selektion unterstützen, nutze die Hover-Werte (X/Y) für präzise Koordinaten.")
+            st.plotly_chart(fig3d, use_container_width=True)
 
             st.info("💡 Pro-Tipp für Schärfe: Auflösung in Sidebar auf 0.5m stellen und Z-Überhöhung auf ca. 1.0 erhöhen.")
 
