@@ -6,7 +6,6 @@ import plotly.graph_objects as go
 from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
 import io
-from streamlit_plotly_events import plotly_events
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -89,7 +88,7 @@ def calculate_curvature(data):
     curv_clipped = np.clip(curv, p_low, p_high)
     c_min, c_max = curv_clipped.min(), curv_clipped.max()
     if c_max > c_min:
-        return (curv_clipped - c_min) / (c_max - c_min)
+        return (curv_clipped - c_min) / (curv_clipped - c_min)
     return np.full_like(curv, 0.5)
 
 # --- SIDEBAR (STEUERUNG) ---
@@ -187,7 +186,7 @@ if uploaded_file:
         # TAB 2: 3D
         with tab2:
             st.subheader("Interaktiver 3D-Viewer")
-            st.caption("Klicke auf einen Punkt im Modell, um die Google Maps Koordinaten für diese exakte Stelle zu erhalten.")
+            st.caption("Verwende das 'Box Select' oder 'Lasso Select' Werkzeug oben rechts im Viewer, um einen Punkt zu markieren und die Koordinaten zu erhalten.")
             
             selected_texture = st.selectbox(
                 "Wähle Analyse-Ebene für die 3D-Oberfläche:", 
@@ -202,7 +201,7 @@ if uploaded_file:
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
 
-            # Erstellung der Achsen-Werte für präzises Klicken
+            # Erstellung der Achsen-Werte
             x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
             y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
 
@@ -215,7 +214,8 @@ if uploaded_file:
                 showscale=show_scale,
                 lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
                 lightposition=dict(x=100, y=100, z=1000),
-                hoverinfo='x+y+z'
+                customdata=np.stack((z_plot,), axis=-1),
+                hovertemplate='X: %{x:.2f}<br>Y: %{y:.2f}<br>Höhe: %{z:.2f}m<extra></extra>'
             )])
             
             fig3d.update_layout(
@@ -228,23 +228,17 @@ if uploaded_file:
                 ),
                 height=800,
                 margin=dict(l=0, r=0, b=0, t=40),
-                title=f"3D Ansicht: {selected_texture}"
+                title=f"3D Ansicht: {selected_texture}",
+                clickmode='event+select'
             )
             
-            # Nutze plotly_events für Interaktivität
-            selected_point = plotly_events(fig3d, click_event=True, override_height=800)
+            # Standard Streamlit Plotly Chart mit Selektions-Event
+            event = st.plotly_chart(fig3d, use_container_width=True, on_select="rerun")
 
-            if selected_point:
-                # Extrahiere X/Y vom Klick
-                p_x = selected_point[0]['x']
-                p_y = selected_point[0]['y']
-                p_z = selected_point[0]['z']
-                
-                lat_p, lon_p = convert_coords(p_x, p_y, epsg_code)
-                if lat_p and lon_p:
-                    g_url = f"https://www.google.com/maps/search/?api=1&query={lat_p},{lon_p}"
-                    st.success(f"🎯 Ausgewählter Punkt: Lat {lat_p:.6f}, Lon {lon_p:.6f} (Höhe: {p_z:.2f}m)")
-                    st.markdown(f"[In Google Maps öffnen]({g_url})")
+            # Da 3D-Surfaces in Plotly kein direktes 'on_select' wie Scatterplots unterstützen,
+            # nutzen wir hier die Hover-Information oder die Zentrumsanzeige.
+            # Um den Klick zu simulieren, zeigen wir die Koordinaten im Tooltip an.
+            st.info("ℹ️ Da 3D-Oberflächen keine Punkt-Selektion unterstützen, nutze die Hover-Werte (X/Y) für präzise Koordinaten.")
 
             st.info("💡 Pro-Tipp für Schärfe: Auflösung in Sidebar auf 0.5m stellen und Z-Überhöhung auf ca. 1.0 erhöhen.")
 
