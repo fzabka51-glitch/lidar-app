@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
 import io
+from streamlit_plotly_events import plotly_events
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -122,13 +123,19 @@ if uploaded_file:
             df = df.sample(2000000, random_state=42)
             st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
 
-        # Standort berechnen
+        # Grenzen für Rückrechnung von Indizes auf Koordinaten
+        min_x, max_x = df.x.min(), df.x.max()
+        min_y, max_y = df.y.min(), df.y.max()
+
+        # Standort berechnen (Standard: Zentrum)
         center_x, center_y = df.x.mean(), df.y.mean()
         lat, lon = convert_coords(center_x, center_y, epsg_code)
         
+        # Container für dynamische Standort-Info
+        location_placeholder = st.empty()
         if lat and lon:
             google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-            st.markdown(f"**📍 Standort (Zentrum):** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
+            location_placeholder.markdown(f"**📍 Standort (Zentrum):** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
 
         # 2. Berechnungen
         with st.spinner("Analysiere Gelände..."):
@@ -180,6 +187,7 @@ if uploaded_file:
         # TAB 2: 3D
         with tab2:
             st.subheader("Interaktiver 3D-Viewer")
+            st.caption("Klicke auf einen Punkt im Modell, um die Google Maps Koordinaten für diese exakte Stelle zu erhalten.")
             
             selected_texture = st.selectbox(
                 "Wähle Analyse-Ebene für die 3D-Oberfläche:", 
@@ -189,34 +197,55 @@ if uploaded_file:
             
             tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
             
-            # Schärfere Einstellung: Erhöhung des Limits auf 400.000 Punkte
+            # Schärfere Einstellung
             step = max(1, int(np.sqrt(gz.size / 400000)))
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
 
+            # Erstellung der Achsen-Werte für präzises Klicken
+            x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
+            y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
+
             fig3d = go.Figure(data=[go.Surface(
+                x=x_vals,
+                y=y_vals,
                 z=z_plot, 
                 surfacecolor=surface_tex, 
                 colorscale=tex_cmap,
                 showscale=show_scale,
                 lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
-                lightposition=dict(x=100, y=100, z=1000)
+                lightposition=dict(x=100, y=100, z=1000),
+                hoverinfo='x+y+z'
             )])
             
             fig3d.update_layout(
                 scene=dict(
                     aspectmode='data',
                     aspectratio=dict(x=1, y=1, z=z_exag),
-                    xaxis=dict(visible=False),
-                    yaxis=dict(visible=False),
+                    xaxis=dict(title="X (m)"),
+                    yaxis=dict(title="Y (m)"),
                     zaxis=dict(title="Höhe (m)")
                 ),
-                height=900,
+                height=800,
                 margin=dict(l=0, r=0, b=0, t=40),
                 title=f"3D Ansicht: {selected_texture}"
             )
             
-            st.plotly_chart(fig3d, use_container_width=True)
+            # Nutze plotly_events für Interaktivität
+            selected_point = plotly_events(fig3d, click_event=True, override_height=800)
+
+            if selected_point:
+                # Extrahiere X/Y vom Klick
+                p_x = selected_point[0]['x']
+                p_y = selected_point[0]['y']
+                p_z = selected_point[0]['z']
+                
+                lat_p, lon_p = convert_coords(p_x, p_y, epsg_code)
+                if lat_p and lon_p:
+                    g_url = f"https://www.google.com/maps/search/?api=1&query={lat_p},{lon_p}"
+                    st.success(f"🎯 Ausgewählter Punkt: Lat {lat_p:.6f}, Lon {lon_p:.6f} (Höhe: {p_z:.2f}m)")
+                    st.markdown(f"[In Google Maps öffnen]({g_url})")
+
             st.info("💡 Pro-Tipp für Schärfe: Auflösung in Sidebar auf 0.5m stellen und Z-Überhöhung auf ca. 1.0 erhöhen.")
 
     except Exception as e:
