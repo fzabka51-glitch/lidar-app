@@ -88,7 +88,7 @@ def calculate_curvature(data):
     curv_clipped = np.clip(curv, p_low, p_high)
     c_min, c_max = curv_clipped.min(), curv_clipped.max()
     if c_max > c_min:
-        return (curv_clipped - c_min) / (curv_clipped - c_min)
+        return (curv_clipped - c_min) / (c_max - c_min)
     return np.full_like(curv, 0.5)
 
 # --- SIDEBAR (STEUERUNG) ---
@@ -169,7 +169,8 @@ if uploaded_file:
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
                         fig, ax = plt.subplots()
-                        ax.imshow(data, cmap=cmap, interpolation='none')
+                        # origin='lower' korrigiert die spiegelverkehrte Y-Achse
+                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                         ax.set_title(name)
                         ax.axis('off')
                         st.pyplot(fig)
@@ -178,7 +179,8 @@ if uploaded_file:
                 sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
                 data, cmap, _ = analysis_models[sel_2d]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap, interpolation='none')
+                # origin='lower' korrigiert die spiegelverkehrte Y-Achse
+                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                 ax.axis('off')
                 st.pyplot(fig)
                 plt.close(fig)
