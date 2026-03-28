@@ -3,7 +3,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-import plotly.express as px
 from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
 import io
@@ -98,17 +97,8 @@ with st.sidebar:
     uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
     st.divider()
-    st.subheader("📍 Geo-Referenz & Marker")
+    st.subheader("📍 Geo-Referenz")
     epsg_code = st.number_input("EPSG Code (UTM)", value=25832)
-    
-    if st.checkbox("Punkt-Annotation hinzufügen"):
-        st.info("Setze Markierungen für Fundorte")
-        poi_name = st.text_input("Name Fundort", "Grabhügel A")
-        poi_x = st.number_input("X Koordinate", value=0.0)
-        poi_y = st.number_input("Y Koordinate", value=0.0)
-        if 'pois' not in st.session_state: st.session_state.pois = []
-        if st.button("Speichern"):
-            st.session_state.pois.append({"name": poi_name, "x": poi_x, "y": poi_y})
     
     st.divider()
     st.subheader("💡 3D Lichtsteuerung")
@@ -124,7 +114,7 @@ with st.sidebar:
     z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
     
     st.subheader("Anzeige")
-    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht", "Vergleich (Sync)"])
+    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
 
 # --- HAUPTBEREICH ---
 if uploaded_file:
@@ -167,30 +157,11 @@ if uploaded_file:
                 "Krümmung (Curvature)": (curv, "RdYlGn", True)
             }
 
-        tab1, tab2, tab3 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion", "📐 Schnittprofil"])
+        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion"])
 
         # TAB 1: 2D
         with tab1:
-            if view_mode == "Vergleich (Sync)":
-                c1, c2 = st.columns(2)
-                m1 = c1.selectbox("Modell Links:", list(analysis_models.keys()), index=0)
-                m2 = c2.selectbox("Modell Rechts:", list(analysis_models.keys()), index=3)
-                
-                d1, cp1, _ = analysis_models[m1]
-                d2, cp2, _ = analysis_models[m2]
-                
-                fig1, ax1 = plt.subplots()
-                ax1.imshow(d1, cmap=cp1, origin='lower')
-                ax1.axis('off')
-                c1.pyplot(fig1)
-                
-                fig2, ax2 = plt.subplots()
-                ax2.imshow(d2, cmap=cp2, origin='lower')
-                ax2.axis('off')
-                c2.pyplot(fig2)
-                plt.close('all')
-            
-            elif view_mode == "Gitter-Übersicht":
+            if view_mode == "Gitter-Übersicht":
                 c1, c2 = st.columns(2)
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
@@ -221,7 +192,7 @@ if uploaded_file:
             x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
             y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
 
-            # Lichtposition berechnen
+            # Lichtposition basierend auf Sidebar-Slidern für den 3D-Effekt
             lx = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.sin(np.deg2rad(sun_azimuth))
             ly = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.cos(np.deg2rad(sun_azimuth))
             lz = 1000 * np.sin(np.deg2rad(sun_altitude))
@@ -233,44 +204,12 @@ if uploaded_file:
                 lightposition=dict(x=lx, y=ly, z=lz)
             )])
             
-            # Annotations hinzufügen
-            if 'pois' in st.session_state:
-                for poi in st.session_state.pois:
-                    fig3d.add_trace(go.Scatter3d(
-                        x=[poi['x']], y=[poi['y']], z=[np.mean(gz) + 5],
-                        mode='markers+text', text=[poi['name']],
-                        marker=dict(size=5, color='red')
-                    ))
-
             fig3d.update_layout(scene=dict(aspectratio=dict(x=1, y=1, z=z_exag),
                                 xaxis=dict(title="X"), yaxis=dict(title="Y")),
                                 height=800, margin=dict(l=0, r=0, b=0, t=40))
             st.plotly_chart(fig3d, use_container_width=True)
 
-        # TAB 3: SCHNITTPROFIL
-        with tab3:
-            st.subheader("📐 Geländeprofil-Analyse")
-            col_p1, col_p2 = st.columns(2)
-            with col_p1:
-                start_x = st.slider("Start X", float(min_x), float(max_x), float(min_x + (max_x-min_x)*0.2))
-                start_y = st.slider("Start Y", float(min_y), float(max_y), float(min_y + (max_y-min_y)*0.5))
-            with col_p2:
-                end_x = st.slider("Ende X", float(min_x), float(max_x), float(min_x + (max_x-min_x)*0.8))
-                end_y = st.slider("Ende Y", float(min_y), float(max_y), float(min_y + (max_y-min_y)*0.5))
-            
-            # Profil berechnen (lineare Interpolation)
-            num_points = 200
-            px_coords = np.linspace(start_x, end_x, num_points)
-            py_coords = np.linspace(start_y, end_y, num_points)
-            
-            # Umrechnung in Gitter-Indizes
-            ix = ((px_coords - min_x) / (max_x - min_x) * (gz.shape[1]-1)).astype(int)
-            iy = ((py_coords - min_y) / (max_y - min_y) * (gz.shape[0]-1)).astype(int)
-            profile_z = gz[iy, ix]
-            dist = np.sqrt((px_coords - start_x)**2 + (py_coords - start_y)**2)
-
-            fig_prof = px.line(x=dist, y=profile_z, labels={'x': 'Distanz (m)', 'y': 'Höhe (m)'}, title="Geländeschnitt")
-            st.plotly_chart(fig_prof, use_container_width=True)
+            st.info("💡 Pro-Tipp: Das Modell 'Live Hillshade' reagiert direkt auf die Sonnen-Regler in der Sidebar.")
 
     except Exception as e:
         st.error(f"Fehler: {e}")
