@@ -3,13 +3,33 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+import plotly.express as px
 from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
 import io
 
+# Versuche pyproj für die Koordinatenumrechnung zu importieren
+try:
+    import pyproj
+    PYPROJ_AVAILABLE = True
+except ImportError:
+    PYPROJ_AVAILABLE = False
+
 # --- SEITENKONFIGURATION ---
 st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
 st.title("🏛️ LiDAR Analyse & High-Performance 3D")
+
+# --- KOORDINATEN-FUNKTION ---
+def convert_coords(x, y, from_epsg=25832):
+    """Wandelt metrische Koordinaten in Lat/Lon um."""
+    if not PYPROJ_AVAILABLE:
+        return None, None
+    try:
+        transformer = pyproj.Transformer.from_crs(f"epsg:{from_epsg}", "epsg:4326", always_xy=True)
+        lon, lat = transformer.transform(x, y)
+        return lat, lon
+    except:
+        return None, None
 
 # --- ARCHÄOLOGISCHE ANALYSE-FUNKTIONEN ---
 
@@ -77,60 +97,105 @@ with st.sidebar:
     st.header("⚙️ Parameter")
     uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
+    st.divider()
+    st.subheader("📍 Geo-Referenz & Marker")
+    epsg_code = st.number_input("EPSG Code (UTM)", value=25832)
+    
+    if st.checkbox("Punkt-Annotation hinzufügen"):
+        st.info("Setze Markierungen für Fundorte")
+        poi_name = st.text_input("Name Fundort", "Grabhügel A")
+        poi_x = st.number_input("X Koordinate", value=0.0)
+        poi_y = st.number_input("Y Koordinate", value=0.0)
+        if 'pois' not in st.session_state: st.session_state.pois = []
+        if st.button("Speichern"):
+            st.session_state.pois.append({"name": poi_name, "x": poi_x, "y": poi_y})
+    
+    st.divider()
+    st.subheader("💡 3D Lichtsteuerung")
+    sun_azimuth = st.slider("Sonnen-Richtung (Azimut)", 0, 360, 315)
+    sun_altitude = st.slider("Sonnen-Höhe", 5, 90, 45)
+    
+    st.divider()
     st.subheader("Raster & Filter")
-    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0, help="Niedrigerer Wert = Höhere Schärfe (z.B. 0.5m)")
+    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
     lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
     
     st.subheader("3D-Eigenschaften")
     z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
     
     st.subheader("Anzeige")
-    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
+    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht", "Vergleich (Sync)"])
 
 # --- HAUPTBEREICH ---
 if uploaded_file:
     try:
         # 1. Daten laden
-        df = pd.read_csv(uploaded_file, sep=r'\s+', header=None, names=['x','y','z'], dtype=np.float32)
+        df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
         if len(df) > 2000000:
             df = df.sample(2000000, random_state=42)
             st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
 
+        min_x, max_x = df.x.min(), df.x.max()
+        min_y, max_y = df.y.min(), df.y.max()
+
+        center_x, center_y = df.x.mean(), df.y.mean()
+        lat, lon = convert_coords(center_x, center_y, epsg_code)
+        
+        location_placeholder = st.empty()
+        if lat and lon:
+            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            location_placeholder.markdown(f"**📍 Zentrum:** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
+
         # 2. Berechnungen
         with st.spinner("Analysiere Gelände..."):
             gz = rasterize_points(df, grid_res)
-            # Reinigung
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
-            # Alle Modelle berechnen
-            nw_h = calculate_hillshade(gz, 315, 45, grid_res)
+            nw_h = calculate_hillshade(gz, sun_azimuth, sun_altitude, grid_res)
             mds = calculate_multi_hillshade(gz, grid_res)
             lrm = calculate_lrm(gz, lrm_sigma)
             slope = calculate_slope(gz, grid_res)
             curv = calculate_curvature(gz)
-            # Fusion
             comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
 
             analysis_models = {
                 "Final Composite (Fusion)": (comp, "gray", False),
-                "NW Hillshade": (nw_h, "gray", False),
+                "Live Hillshade (Licht)": (nw_h, "gray", False),
                 "MDS Composite": (mds, "gray", False),
                 "Restrelief (LRM)": (lrm, "RdBu", True),
                 "Hangneigung (Slope)": (slope, "plasma", True),
                 "Krümmung (Curvature)": (curv, "RdYlGn", True)
             }
 
-        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion (Interaktiv)"])
+        tab1, tab2, tab3 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion", "📐 Schnittprofil"])
 
         # TAB 1: 2D
         with tab1:
-            if view_mode == "Gitter-Übersicht":
+            if view_mode == "Vergleich (Sync)":
+                c1, c2 = st.columns(2)
+                m1 = c1.selectbox("Modell Links:", list(analysis_models.keys()), index=0)
+                m2 = c2.selectbox("Modell Rechts:", list(analysis_models.keys()), index=3)
+                
+                d1, cp1, _ = analysis_models[m1]
+                d2, cp2, _ = analysis_models[m2]
+                
+                fig1, ax1 = plt.subplots()
+                ax1.imshow(d1, cmap=cp1, origin='lower')
+                ax1.axis('off')
+                c1.pyplot(fig1)
+                
+                fig2, ax2 = plt.subplots()
+                ax2.imshow(d2, cmap=cp2, origin='lower')
+                ax2.axis('off')
+                c2.pyplot(fig2)
+                plt.close('all')
+            
+            elif view_mode == "Gitter-Übersicht":
                 c1, c2 = st.columns(2)
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
                         fig, ax = plt.subplots()
-                        # 'none' interpolation verhindert Verschwimmen in Matplotlib
-                        ax.imshow(data, cmap=cmap, interpolation='none')
+                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                         ax.set_title(name)
                         ax.axis('off')
                         st.pyplot(fig)
@@ -139,52 +204,73 @@ if uploaded_file:
                 sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
                 data, cmap, _ = analysis_models[sel_2d]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap, interpolation='none')
+                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                 ax.axis('off')
                 st.pyplot(fig)
                 plt.close(fig)
 
         # TAB 2: 3D
         with tab2:
-            st.subheader("Interaktiver 3D-Viewer")
-            
-            selected_texture = st.selectbox(
-                "Wähle Analyse-Ebene für die 3D-Oberfläche:", 
-                list(analysis_models.keys()),
-                index=0
-            )
-            
+            st.subheader("Dynamischer 3D-Viewer")
+            selected_texture = st.selectbox("Textur wählen:", list(analysis_models.keys()), index=0)
             tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
             
-            # Schärfere Einstellung: Erhöhung des Limits auf 400.000 Punkte
             step = max(1, int(np.sqrt(gz.size / 400000)))
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
+            x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
+            y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
+
+            # Lichtposition berechnen
+            lx = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.sin(np.deg2rad(sun_azimuth))
+            ly = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.cos(np.deg2rad(sun_azimuth))
+            lz = 1000 * np.sin(np.deg2rad(sun_altitude))
 
             fig3d = go.Figure(data=[go.Surface(
-                z=z_plot, 
-                surfacecolor=surface_tex, 
-                colorscale=tex_cmap,
-                showscale=show_scale,
-                lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
-                lightposition=dict(x=100, y=100, z=1000)
+                x=x_vals, y=y_vals, z=z_plot, 
+                surfacecolor=surface_tex, colorscale=tex_cmap,
+                lighting=dict(ambient=0.4, diffuse=0.8, roughness=0.9, specular=0.2),
+                lightposition=dict(x=lx, y=ly, z=lz)
             )])
             
-            fig3d.update_layout(
-                scene=dict(
-                    aspectmode='data',
-                    aspectratio=dict(x=1, y=1, z=z_exag),
-                    xaxis=dict(visible=False),
-                    yaxis=dict(visible=False),
-                    zaxis=dict(title="Höhe (m)")
-                ),
-                height=900,
-                margin=dict(l=0, r=0, b=0, t=40),
-                title=f"3D Ansicht: {selected_texture}"
-            )
-            
+            # Annotations hinzufügen
+            if 'pois' in st.session_state:
+                for poi in st.session_state.pois:
+                    fig3d.add_trace(go.Scatter3d(
+                        x=[poi['x']], y=[poi['y']], z=[np.mean(gz) + 5],
+                        mode='markers+text', text=[poi['name']],
+                        marker=dict(size=5, color='red')
+                    ))
+
+            fig3d.update_layout(scene=dict(aspectratio=dict(x=1, y=1, z=z_exag),
+                                xaxis=dict(title="X"), yaxis=dict(title="Y")),
+                                height=800, margin=dict(l=0, r=0, b=0, t=40))
             st.plotly_chart(fig3d, use_container_width=True)
-            st.info("💡 Pro-Tipp für Schärfe: Auflösung in Sidebar auf 0.5m stellen und Z-Überhöhung auf ca. 1.0 erhöhen.")
+
+        # TAB 3: SCHNITTPROFIL
+        with tab3:
+            st.subheader("📐 Geländeprofil-Analyse")
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                start_x = st.slider("Start X", float(min_x), float(max_x), float(min_x + (max_x-min_x)*0.2))
+                start_y = st.slider("Start Y", float(min_y), float(max_y), float(min_y + (max_y-min_y)*0.5))
+            with col_p2:
+                end_x = st.slider("Ende X", float(min_x), float(max_x), float(min_x + (max_x-min_x)*0.8))
+                end_y = st.slider("Ende Y", float(min_y), float(max_y), float(min_y + (max_y-min_y)*0.5))
+            
+            # Profil berechnen (lineare Interpolation)
+            num_points = 200
+            px_coords = np.linspace(start_x, end_x, num_points)
+            py_coords = np.linspace(start_y, end_y, num_points)
+            
+            # Umrechnung in Gitter-Indizes
+            ix = ((px_coords - min_x) / (max_x - min_x) * (gz.shape[1]-1)).astype(int)
+            iy = ((py_coords - min_y) / (max_y - min_y) * (gz.shape[0]-1)).astype(int)
+            profile_z = gz[iy, ix]
+            dist = np.sqrt((px_coords - start_x)**2 + (py_coords - start_y)**2)
+
+            fig_prof = px.line(x=dist, y=profile_z, labels={'x': 'Distanz (m)', 'y': 'Höhe (m)'}, title="Geländeschnitt")
+            st.plotly_chart(fig_prof, use_container_width=True)
 
     except Exception as e:
         st.error(f"Fehler: {e}")
