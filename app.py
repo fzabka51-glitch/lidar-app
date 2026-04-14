@@ -3,16 +3,37 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from scipy.ndimage import gaussian_filter, laplace
+from scipy.ndimage import laplace, gaussian_filter, uniform_filter
 import datashader as ds
+import io
 
-# --- KONFIGURATION ---
-st.set_page_config(page_title="LiDAR Prospektion Pro", layout="wide")
+# Versuche pyproj für die Koordinatenumrechnung zu importieren
+try:
+    import pyproj
+    PYPROJ_AVAILABLE = True
+except ImportError:
+    PYPROJ_AVAILABLE = False
 
-# --- CORE FUNKTIONEN ---
+# --- SEITENKONFIGURATION ---
+st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
+st.title("🏛️ LiDAR Analyse & High-Performance 3D")
+
+# --- KOORDINATEN-FUNKTION ---
+def convert_coords(x, y, from_epsg=25832):
+    """Wandelt metrische Koordinaten in Lat/Lon um."""
+    if not PYPROJ_AVAILABLE:
+        return None, None
+    try:
+        transformer = pyproj.Transformer.from_crs(f"epsg:{from_epsg}", "epsg:4326", always_xy=True)
+        lon, lat = transformer.transform(x, y)
+        return lat, lon
+    except:
+        return None, None
+
+# --- ARCHÄOLOGISCHE ANALYSE-FUNKTIONEN ---
 
 def rasterize_points(df, res):
-    """Rasterisierung mit Datashader."""
+    """Blitzschnelle Rasterisierung von Millionen Punkten mittels Datashader."""
     cvs = ds.Canvas(
         plot_width=int((df.x.max() - df.x.min()) / res),
         plot_height=int((df.y.max() - df.y.min()) / res),
@@ -22,146 +43,183 @@ def rasterize_points(df, res):
     agg = cvs.points(df, 'x', 'y', ds.mean('z'))
     return np.array(agg.values, dtype=np.float32)
 
-def get_slope(data, res):
-    """Berechnet die Hangneigung (Slope)."""
-    gy, gx = np.gradient(data, res, res)
-    slope = np.arctan(np.sqrt(gx**2 + gy**2))
-    return np.rad2deg(slope)
-
-def get_hillshade(data, azimuth, altitude, res):
-    """Klassisches Hillshading."""
+def calculate_hillshade(data, azimuth=315, angle_altitude=45, res=1.0):
+    """Berechnet ein Schummerungsbild (Hillshade)."""
     azimuth_rad = np.deg2rad(azimuth)
-    altitude_rad = np.deg2rad(altitude)
+    altitude_rad = np.deg2rad(angle_altitude)
     gy, gx = np.gradient(data, res, res)
     slope = np.arctan(np.sqrt(gx**2 + gy**2))
     aspect = np.arctan2(-gy, gx)
     shade = (np.cos(altitude_rad) * np.cos(slope)) + \
             (np.sin(altitude_rad) * np.sin(slope) * np.cos(azimuth_rad - aspect))
-    return np.clip(shade, 0, 1)
+    return ((shade + 1) / 2).astype(np.float32)
 
-def get_multi_hillshade(data, res):
-    """MDS: Multi-Directional Shading aus 8 Richtungen für maximale Struktur-Erkennung."""
-    combined = np.zeros_like(data)
-    for az in range(0, 360, 45):
-        combined += get_hillshade(data, az, 35, res)
-    return combined / 8.0
+def calculate_multi_hillshade(data, res=1.0):
+    """Multi-Directional Shading (MDS) aus 4 Richtungen."""
+    h1 = calculate_hillshade(data, 315, 45, res)
+    h2 = calculate_hillshade(data, 45, 45, res)
+    h3 = calculate_hillshade(data, 135, 45, res)
+    h4 = calculate_hillshade(data, 225, 45, res)
+    return (h1 + h2 + h3 + h4) / 4.0
 
-def get_lrm(data, sigma):
-    """Local Relief Model - Extrahiert die Mikro-Topographie."""
-    low_pass = gaussian_filter(data, sigma=sigma)
-    diff = data - low_pass
-    # Kontrast-Stretch auf 0-1
+def calculate_lrm(data, sigma=15):
+    """Local Relief Model (LRM) / Residual Topography."""
+    smoothed = gaussian_filter(data, sigma=sigma)
+    residual = data - smoothed
+    p_low, p_high = np.percentile(residual, (5, 95))
+    res_clipped = np.clip(residual, p_low, p_high)
+    res_min, res_max = res_clipped.min(), res_clipped.max()
+    if res_max > res_min:
+        return (res_clipped - res_min) / (res_max - res_min)
+    return np.full_like(residual, 0.5)
+
+def calculate_openness(data, size=5):
+    """Positive Openness (Proxy für Sky-View-Factor). 
+    Hebt Gräben und Wälle massiv hervor."""
+    mean_val = uniform_filter(data, size=size)
+    diff = data - mean_val
     p_low, p_high = np.percentile(diff, (2, 98))
-    diff_clipped = np.clip(diff, p_low, p_high)
-    return (diff_clipped - p_low) / (p_high - p_low)
+    diff = np.clip(diff, p_low, p_high)
+    d_min, d_max = diff.min(), diff.max()
+    if d_max > d_min:
+        return (diff - d_min) / (d_max - d_min)
+    return np.full_like(data, 0.5)
 
-# --- UI SIDEBAR ---
+def calculate_slope(data, res=1.0):
+    """Berechnet die Hangneigung in Grad."""
+    gy, gx = np.gradient(data, res, res)
+    slope_deg = np.rad2deg(np.arctan(np.sqrt(gx**2 + gy**2)))
+    p_high = np.nanpercentile(slope_deg, 98)
+    return np.clip(slope_deg, 0, p_high)
+
+def calculate_curvature(data):
+    """Berechnet die lokale Krümmung (Laplace)."""
+    curv = -laplace(data)
+    p_low, p_high = np.percentile(curv, (2, 98))
+    curv_clipped = np.clip(curv, p_low, p_high)
+    c_min, c_max = curv_clipped.min(), curv_clipped.max()
+    if c_max > c_min:
+        return (curv_clipped - c_min) / (c_max - c_min)
+    return np.full_like(curv, 0.5)
+
+# --- SIDEBAR (STEUERUNG) ---
 with st.sidebar:
-    st.header("🏛️ Prospektions-Parameter")
-    uploaded_file = st.file_uploader("XYZ Datei hochladen", type=["xyz", "txt"])
+    st.header("⚙️ Parameter")
+    uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
     st.divider()
-    grid_res = st.slider("Raster-Auflösung (m)", 0.1, 2.0, 0.5, step=0.1)
-    lrm_sigma = st.slider("Struktur-Fokus (Sigma)", 5, 50, 15, help="Kleiner = feine Mauern, Größer = breite Gräben")
+    st.subheader("Geo-Referenz")
+    epsg_code = st.number_input("EPSG Code (z.B. UTM 32N: 25832)", value=25832)
+    if not PYPROJ_AVAILABLE:
+        st.warning("⚠️ 'pyproj' nicht gefunden. Koordinatenumrechnung deaktiviert.")
     
     st.divider()
-    st.subheader("3D Darstellung")
-    z_exag = st.slider("Z-Überhöhung", 1.0, 15.0, 3.0)
-    overlay_opacity = st.slider("Overlay Deckkraft", 0.0, 1.0, 0.7)
+    st.subheader("Raster & Filter")
+    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
+    lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
+    openness_size = st.slider("Openness Radius", 2, 20, 5)
+    
+    st.subheader("3D-Eigenschaften")
+    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
+    
+    st.subheader("Anzeige")
+    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
 
-# --- MAIN APP ---
+# --- HAUPTBEREICH ---
 if uploaded_file:
     try:
-        # 1. Load Data
+        # 1. Daten laden
         df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
         if len(df) > 2000000:
-            df = df.sample(2000000)
+            df = df.sample(2000000, random_state=42)
             st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
 
-        # 2. Process
-        with st.spinner("Berechne archäologische Layer..."):
+        min_x, max_x = df.x.min(), df.x.max()
+        min_y, max_y = df.y.min(), df.y.max()
+        center_x, center_y = df.x.mean(), df.y.mean()
+        lat, lon = convert_coords(center_x, center_y, epsg_code)
+        
+        location_placeholder = st.empty()
+        if lat and lon:
+            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            location_placeholder.markdown(f"**📍 Standort (Zentrum):** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
+
+        # 2. Berechnungen
+        with st.spinner("Analysiere Gelände..."):
             gz = rasterize_points(df, grid_res)
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
-            # Layer Generierung
-            slope = get_slope(gz, grid_res)
-            mds = get_multi_hillshade(gz, grid_res)
-            lrm = get_lrm(gz, lrm_sigma)
+            nw_h = calculate_hillshade(gz, 315, 45, grid_res)
+            mds = calculate_multi_hillshade(gz, grid_res)
+            lrm = calculate_lrm(gz, lrm_sigma)
+            slope = calculate_slope(gz, grid_res)
+            curv = calculate_curvature(gz)
+            opn = calculate_openness(gz, openness_size)
             
-            # Profi-Ansatz: RGB Composite (Slope = Rot, LRM = Grün, MDS = Blau)
-            # Das lässt archäologische Anomalien farblich hervortreten
+            # RGB Prospektion: Slope (R), LRM (G), Openness (B)
             slope_norm = (slope - slope.min()) / (slope.max() - slope.min())
-            composite_rgb = np.stack([slope_norm, lrm, mds], axis=-1)
+            comp_rgb = np.stack([slope_norm, lrm, opn], axis=-1)
 
-        tab1, tab2 = st.tabs(["🔍 Analyse-Dashboard", "🌐 Interaktives 3D"])
+            analysis_models = {
+                "Prospektion RGB (Multichannel)": (comp_rgb, None, False),
+                "Restrelief (LRM)": (lrm, "RdBu", True),
+                "Openness (Sky View)": (opn, "magma", True),
+                "MDS Composite": (mds, "gray", False),
+                "Hangneigung (Slope)": (slope, "plasma", True),
+                "Krümmung (Curvature)": (curv, "RdYlGn", True),
+                "NW Hillshade": (nw_h, "gray", False)
+            }
+
+        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion"])
 
         with tab1:
-            st.subheader("Visualisierungs-Vergleich")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("**Multi-Directional Hillshade (MDS)**")
-                fig1, ax1 = plt.subplots()
-                ax1.imshow(mds, cmap="gray", origin="lower")
-                ax1.axis("off")
-                st.pyplot(fig1)
-                
-                st.write("**Hangneigung (Slope)**")
-                fig2, ax2 = plt.subplots()
-                ax2.imshow(slope, cmap="magma", origin="lower")
-                ax2.axis("off")
-                st.pyplot(fig2)
-
-            with col2:
-                st.write("**Local Relief Model (Röntgenblick)**")
-                fig3, ax3 = plt.subplots()
-                ax3.imshow(lrm, cmap="RdGy", origin="lower")
-                ax3.axis("off")
-                st.pyplot(fig3)
-                
-                st.write("**Archäologische Fusion (RGB)**")
-                st.info("Rot: Steilheit | Grün: Relief | Blau: Schatten")
-                fig4, ax4 = plt.subplots()
-                ax4.imshow(composite_rgb, origin="lower")
-                ax4.axis("off")
-                st.pyplot(fig4)
+            if view_mode == "Gitter-Übersicht":
+                c1, c2 = st.columns(2)
+                for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
+                    with [c1, c2][i % 2]:
+                        fig, ax = plt.subplots()
+                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
+                        ax.set_title(name)
+                        ax.axis('off')
+                        st.pyplot(fig)
+                        plt.close(fig)
+            else:
+                sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
+                data, cmap, _ = analysis_models[sel_2d]
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
+                ax.axis('off')
+                st.pyplot(fig)
+                plt.close(fig)
 
         with tab2:
-            st.subheader("3D Gelände-Exploration")
+            st.subheader("3D-Viewer")
+            selected_texture = st.selectbox("3D-Oberfläche wählen:", list(analysis_models.keys()), index=0)
+            tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
             
-            # Downsampling für 3D Performance
-            step = max(1, gz.shape[0] // 300)
-            z_3d = gz[::step, ::step]
-            
-            # Wähle Textur
-            tex_mode = st.radio("Oberfläche:", ["RGB Fusion", "Röntgen (LRM)", "Schattierung (MDS)"], horizontal=True)
-            if tex_mode == "RGB Fusion":
-                tex_3d = composite_rgb[::step, ::step]
-                colorscale = None # RGB nutzt direkt die Daten
-            elif tex_mode == "Röntgen (LRM)":
-                tex_3d = lrm[::step, ::step]
-                colorscale = "RdGy"
-            else:
-                tex_3d = mds[::step, ::step]
-                colorscale = "gray"
+            step = max(1, int(np.sqrt(gz.size / 400000)))
+            z_plot = gz[::step, ::step]
+            surface_tex = tex_data[::step, ::step]
+
+            x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
+            y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
 
             fig3d = go.Figure(data=[go.Surface(
-                z=z_3d,
-                surfacecolor=tex_3d if colorscale else None,
-                colorscale=colorscale,
-                opacity=overlay_opacity
+                x=x_vals, y=y_vals, z=z_plot, 
+                surfacecolor=surface_tex if tex_cmap else None, 
+                colorscale=tex_cmap,
+                showscale=show_scale,
+                lighting=dict(ambient=0.6, diffuse=0.8, roughness=0.5),
+                hovertemplate='Höhe: %{z:.2f}m<extra></extra>'
             )])
-
+            
             fig3d.update_layout(
                 scene=dict(
-                    aspectmode='manual',
-                    aspectratio=dict(x=1, y=1, z=z_exag/10),
-                    xaxis=dict(visible=False),
-                    yaxis=dict(visible=False),
-                    zaxis=dict(title="Höhe")
+                    aspectmode='data',
+                    aspectratio=dict(x=1, y=1, z=z_exag),
+                    xaxis=dict(title="X (m)"), yaxis=dict(title="Y (m)"), zaxis=dict(title="Höhe (m)")
                 ),
-                margin=dict(l=0, r=0, b=0, t=0),
-                height=800
+                height=800, margin=dict(l=0, r=0, b=0, t=40)
             )
             st.plotly_chart(fig3d, use_container_width=True)
 
