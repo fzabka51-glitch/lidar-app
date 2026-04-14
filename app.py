@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from scipy.ndimage import laplace, gaussian_filter
+from scipy.ndimage import laplace, gaussian_filter, uniform_filter
 import datashader as ds
 import io
 
@@ -15,8 +15,8 @@ except ImportError:
     PYPROJ_AVAILABLE = False
 
 # --- SEITENKONFIGURATION ---
-st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
-st.title("🏛️ LiDAR Analyse & High-Performance 3D")
+st.set_page_config(page_title="LiDAR Archäologie Pro X-Ray", layout="wide")
+st.title("🏛️ LiDAR Archäologie: Virtual Excavation & X-Ray")
 
 # --- KOORDINATEN-FUNKTION ---
 def convert_coords(x, y, from_epsg=25832):
@@ -54,67 +54,50 @@ def calculate_hillshade(data, azimuth=315, angle_altitude=45, res=1.0):
             (np.sin(altitude_rad) * np.sin(slope) * np.cos(azimuth_rad - aspect))
     return ((shade + 1) / 2).astype(np.float32)
 
-def calculate_multi_hillshade(data, res=1.0):
-    """Multi-Directional Shading (MDS) aus 4 Richtungen."""
-    h1 = calculate_hillshade(data, 315, 45, res)
-    h2 = calculate_hillshade(data, 45, 45, res)
-    h3 = calculate_hillshade(data, 135, 45, res)
-    h4 = calculate_hillshade(data, 225, 45, res)
-    return (h1 + h2 + h3 + h4) / 4.0
-
 def calculate_lrm(data, sigma=15):
-    """Local Relief Model (LRM) / Residual Topography."""
+    """Local Relief Model (LRM) - Entfernt großräumige Topographie."""
     smoothed = gaussian_filter(data, sigma=sigma)
     residual = data - smoothed
-    p_low, p_high = np.percentile(residual, (5, 95))
+    p_low, p_high = np.percentile(residual, (2, 98))
     res_clipped = np.clip(residual, p_low, p_high)
-    # Normalisierung auf 0-1 für Texturierung
+    # Normalisierung
     res_min, res_max = res_clipped.min(), res_clipped.max()
     if res_max > res_min:
         return (res_clipped - res_min) / (res_max - res_min)
     return np.full_like(residual, 0.5)
 
-def calculate_slope(data, res=1.0):
-    """Berechnet die Hangneigung in Grad."""
-    gy, gx = np.gradient(data, res, res)
-    slope_deg = np.rad2deg(np.arctan(np.sqrt(gx**2 + gy**2)))
-    p_high = np.nanpercentile(slope_deg, 98)
-    return np.clip(slope_deg, 0, p_high)
-
-def calculate_curvature(data):
-    """Berechnet die lokale Krümmung (Laplace)."""
-    curv = -laplace(data)
-    p_low, p_high = np.percentile(curv, (2, 98))
-    curv_clipped = np.clip(curv, p_low, p_high)
-    c_min, c_max = curv_clipped.min(), curv_clipped.max()
-    if c_max > c_min:
-        return (curv_clipped - c_min) / (c_max - c_min)
-    return np.full_like(curv, 0.5)
+def calculate_openness(data, size=5):
+    """Vereinfachter Sky View Factor / Openness Effekt. 
+    Zeigt 'Eingrabungen' extrem deutlich."""
+    mean_val = uniform_filter(data, size=size)
+    diff = data - mean_val
+    # Verstärke die Kontraste für archäologische Features
+    p_low, p_high = np.percentile(diff, (5, 95))
+    diff = np.clip(diff, p_low, p_high)
+    d_min, d_max = diff.min(), diff.max()
+    return (diff - d_min) / (d_max - d_min) if d_max > d_min else diff
 
 # --- SIDEBAR (STEUERUNG) ---
 with st.sidebar:
-    st.header("⚙️ Parameter")
+    st.header("⚙️ Analyse-Werkzeuge")
     uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
     st.divider()
-    st.subheader("📍 Geo-Referenz")
-    epsg_code = st.number_input("EPSG Code (UTM)", value=25832)
+    st.subheader("Geo-Referenz")
+    epsg_code = st.number_input("EPSG Code (UTM 32N: 25832)", value=25832)
     
     st.divider()
-    st.subheader("💡 3D Lichtsteuerung")
-    sun_azimuth = st.slider("Sonnen-Richtung (Azimut)", 0, 360, 315)
-    sun_altitude = st.slider("Sonnen-Höhe", 5, 90, 45)
+    st.subheader("Virtual Digging (LRM/SVF)")
+    grid_res = st.number_input("Auflösung (m)", 0.1, 5.0, 0.5)
+    lrm_sigma = st.slider("Filter-Tiefe (Sigma)", 1, 100, 20, help="Höherer Wert zeigt größere Strukturen, kleinerer Wert feine Details.")
+    svf_intensity = st.slider("Openness Radius", 2, 20, 5)
     
-    st.divider()
-    st.subheader("Raster & Filter")
-    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
-    lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
+    st.subheader("3D-Visualisierung")
+    z_exag = st.slider("Z-Überhöhung", 0.1, 10.0, 2.0)
+    opacity = st.slider("Oberflächen-Transparenz", 0.1, 1.0, 1.0)
     
-    st.subheader("3D-Eigenschaften")
-    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
-    
-    st.subheader("Anzeige")
-    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
+    st.subheader("Schnitt-Werkzeug")
+    profile_axis = st.radio("Profil-Richtung", ["Horizontal", "Vertikal"])
 
 # --- HAUPTBEREICH ---
 if uploaded_file:
@@ -127,91 +110,106 @@ if uploaded_file:
 
         min_x, max_x = df.x.min(), df.x.max()
         min_y, max_y = df.y.min(), df.y.max()
-
-        center_x, center_y = df.x.mean(), df.y.mean()
-        lat, lon = convert_coords(center_x, center_y, epsg_code)
         
-        location_placeholder = st.empty()
-        if lat and lon:
-            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-            location_placeholder.markdown(f"**📍 Zentrum:** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
-
         # 2. Berechnungen
-        with st.spinner("Analysiere Gelände..."):
+        with st.spinner("Generiere virtuelle Ausgrabung..."):
             gz = rasterize_points(df, grid_res)
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
-            nw_h = calculate_hillshade(gz, sun_azimuth, sun_altitude, grid_res)
-            mds = calculate_multi_hillshade(gz, grid_res)
+            # Archäologische Layer
             lrm = calculate_lrm(gz, lrm_sigma)
-            slope = calculate_slope(gz, grid_res)
-            curv = calculate_curvature(gz)
-            comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
+            openness = calculate_openness(gz, svf_intensity)
+            hs = calculate_hillshade(gz, 315, 45, grid_res)
+            
+            # Kombiniertes 'X-Ray' Bild
+            xray = np.clip(hs * 0.4 + lrm * 0.6, 0, 1)
 
             analysis_models = {
-                "Final Composite (Fusion)": (comp, "gray", False),
-                "Live Hillshade (Licht)": (nw_h, "gray", False),
-                "MDS Composite": (mds, "gray", False),
-                "Restrelief (LRM)": (lrm, "RdBu", True),
-                "Hangneigung (Slope)": (slope, "plasma", True),
-                "Krümmung (Curvature)": (curv, "RdYlGn", True)
+                "X-Ray Composite": (xray, "gray", "Kombination aus Relief und Schatten"),
+                "Restrelief (LRM)": (lrm, "RdBu_r", "Entfernt den Hang, zeigt nur Strukturen"),
+                "Openness / SVF": (openness, "magma", "Highlights für Gräben und Mauern"),
+                "Schummerung": (hs, "gray", "Klassische Ansicht"),
+                "Höhenmodell": (gz, "terrain", "Absolute Höhen")
             }
 
-        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion"])
+        tab1, tab2, tab3 = st.tabs(["🔍 Detektion (2D)", "🏢 Gelände-Schnitt", "🌐 3D Prospektion"])
 
-        # TAB 1: 2D
+        # TAB 1: 2D DETEKTION
         with tab1:
-            if view_mode == "Gitter-Übersicht":
-                c1, c2 = st.columns(2)
-                for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
-                    with [c1, c2][i % 2]:
-                        fig, ax = plt.subplots()
-                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
-                        ax.set_title(name)
-                        ax.axis('off')
-                        st.pyplot(fig)
-                        plt.close(fig)
-            else:
-                sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
-                data, cmap, _ = analysis_models[sel_2d]
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
-                ax.axis('off')
-                st.pyplot(fig)
-                plt.close(fig)
-
-        # TAB 2: 3D
-        with tab2:
-            st.subheader("Dynamischer 3D-Viewer")
-            selected_texture = st.selectbox("Textur wählen:", list(analysis_models.keys()), index=0)
-            tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
+            sel_2d = st.selectbox("Analyse-Modus:", list(analysis_models.keys()))
+            data, cmap, desc = analysis_models[sel_2d]
+            st.caption(desc)
             
-            step = max(1, int(np.sqrt(gz.size / 400000)))
+            fig, ax = plt.subplots(figsize=(10, 8))
+            im = ax.imshow(data, cmap=cmap, origin='lower', extent=[min_x, max_x, min_y, max_y])
+            ax.set_xlabel("Easting")
+            ax.set_ylabel("Northing")
+            plt.colorbar(im, ax=ax, label="Intensität")
+            st.pyplot(fig)
+            plt.close(fig)
+
+        # TAB 2: PROFIL-SCHNITT (Das "Unter-die-Erde" Tool)
+        with tab2:
+            st.subheader("Archäologischer Geländeschnitt")
+            st.info("Bewege den Schieberegler, um das Gelände vertikal zu schneiden.")
+            
+            if profile_axis == "Horizontal":
+                slice_idx = st.slider("Y-Position wählen", 0, gz.shape[0]-1, gz.shape[0]//2)
+                profile_data = gz[slice_idx, :]
+                dist_axis = np.linspace(0, gz.shape[1] * grid_res, gz.shape[1])
+                title = f"Ost-West Schnitt bei Y-Index {slice_idx}"
+            else:
+                slice_idx = st.slider("X-Position wählen", 0, gz.shape[1]-1, gz.shape[1]//2)
+                profile_data = gz[:, slice_idx]
+                dist_axis = np.linspace(0, gz.shape[0] * grid_res, gz.shape[0])
+                title = f"Nord-Süd Schnitt bei X-Index {slice_idx}"
+
+            fig_prof = go.Figure()
+            fig_prof.add_trace(go.Scatter(x=dist_axis, y=profile_data, fill='tozeroy', line=dict(color='brown', width=2)))
+            fig_prof.update_layout(
+                title=title,
+                xaxis_title="Distanz im Schnitt (m)",
+                yaxis_title="Höhe über NN (m)",
+                height=400,
+                template="plotly_white"
+            )
+            st.plotly_chart(fig_prof, use_container_width=True)
+            st.write("💡 Hier siehst du die exakte Form von Gräben oder Wällen, die oft unter 20cm tief sind.")
+
+        # TAB 3: 3D
+        with tab3:
+            selected_texture = st.selectbox("Textur für 3D-Modell:", list(analysis_models.keys()), key="3d_sel")
+            tex_data, tex_cmap, _ = analysis_models[selected_texture]
+            
+            # Downsampling für Performance
+            res_target = 200
+            step = max(1, gz.shape[0] // res_target)
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
+
             x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
             y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
 
-            # Lichtposition basierend auf Sidebar-Slidern für den 3D-Effekt
-            lx = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.sin(np.deg2rad(sun_azimuth))
-            ly = 1000 * np.cos(np.deg2rad(sun_altitude)) * np.cos(np.deg2rad(sun_azimuth))
-            lz = 1000 * np.sin(np.deg2rad(sun_altitude))
-
             fig3d = go.Figure(data=[go.Surface(
-                x=x_vals, y=y_vals, z=z_plot, 
-                surfacecolor=surface_tex, colorscale=tex_cmap,
-                lighting=dict(ambient=0.4, diffuse=0.8, roughness=0.9, specular=0.2),
-                lightposition=dict(x=lx, y=ly, z=lz)
+                x=x_vals, y=y_vals, z=z_plot,
+                surfacecolor=surface_tex,
+                colorscale=tex_cmap,
+                opacity=opacity,
+                lighting=dict(ambient=0.7, diffuse=0.9),
+                hovertemplate='Höhe: %{z:.2f}m<extra></extra>'
             )])
             
-            fig3d.update_layout(scene=dict(aspectratio=dict(x=1, y=1, z=z_exag),
-                                xaxis=dict(title="X"), yaxis=dict(title="Y")),
-                                height=800, margin=dict(l=0, r=0, b=0, t=40))
+            fig3d.update_layout(
+                scene=dict(
+                    aspectmode='data',
+                    aspectratio=dict(x=1, y=1, z=z_exag),
+                ),
+                height=700,
+                margin=dict(l=0, r=0, b=0, t=0)
+            )
             st.plotly_chart(fig3d, use_container_width=True)
 
-            st.info("💡 Pro-Tipp: Das Modell 'Live Hillshade' reagiert direkt auf die Sonnen-Regler in der Sidebar.")
-
     except Exception as e:
-        st.error(f"Fehler: {e}")
+        st.error(f"Fehler bei der Analyse: {e}")
 else:
-    st.info("Bitte XYZ-Datei hochladen.")
+    st.info("Bitte lade eine XYZ-Datei hoch, um mit der virtuellen Ausgrabung zu beginnen.")
