@@ -3,10 +3,64 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from scipy.ndimage import laplace, gaussian_filter, generic_filter
+from scipy.ndimage import laplace, gaussian_filter
 import datashader as ds
 import io
 import base64
+import json
+import requests
+import time
+
+# --- API KONFIGURATION ---
+apiKey = "" # Wird von der Umgebung automatisch gefüllt
+
+def call_gemini_vision(base64_image, analysis_type):
+    """Sendet das Bild an Gemini zur archäologischen Analyse."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
+    
+    prompt = f"""
+    Du bist ein Experte für LiDAR-Archäologie. Analysiere dieses LiDAR-Geländemodell ({analysis_type}).
+    Suche nach anthropogenen (menschengemachten) Strukturen wie:
+    1. Grabhügel (kleine, kreisförmige Erhebungen)
+    2. Hohlwege (lineare, tief eingeschnittene Pfade)
+    3. Wallanlagen oder Gräben (geometrische Strukturen)
+    4. Siedlungsreste (rechteckige Grundrisse)
+    5. Landwirtschaftliche Spuren (Wölbäcker oder alte Flurgrenzen)
+
+    Beschreibe auffällige Merkmale und gib eine Einschätzung ab, ob es sich um natürliche Geologie oder potenzielle Archäologie handelt.
+    Antworte auf Deutsch, präzise und fachlich fundiert.
+    """
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": base64_image
+                    }
+                }
+            ]
+        }]
+    }
+
+    # Exponential Backoff Implementierung
+    for delay in [1, 2, 4, 8, 16]:
+        try:
+            response = requests.post(url, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Keine Analyse möglich.")
+            elif response.status_code == 429: # Rate Limit
+                time.sleep(delay)
+                continue
+            else:
+                return f"Fehler: {response.status_code} - {response.text}"
+        except Exception as e:
+            time.sleep(delay)
+            last_err = str(e)
+    return f"API-Verbindungsfehler nach mehreren Versuchen: {last_err}"
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -16,20 +70,10 @@ except ImportError:
     PYPROJ_AVAILABLE = False
 
 # --- SEITENKONFIGURATION ---
-st.set_page_config(page_title="LiDAR Archäologie Pro+", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
+st.title("🏛️ LiDAR Analyse & AI Prospektion")
 
-# Custom CSS für besseres Design
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
-    .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #ffffff; border-radius: 4px 4px 0px 0px; gap: 1px; }
-    .stTabs [aria-selected="true"] { background-color: #e1e4e8; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- HILFSFUNKTIONEN ---
-
+# --- KOORDINATEN-FUNKTION ---
 def convert_coords(x, y, from_epsg=25832):
     if not PYPROJ_AVAILABLE:
         return None, None
@@ -40,15 +84,7 @@ def convert_coords(x, y, from_epsg=25832):
     except:
         return None, None
 
-def get_image_download_link(fig, filename="analysis.png"):
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches='tight')
-    img_str = base64.b64encode(buf.getvalue()).decode()
-    href = f'<a href="data:image/png;base64,{img_str}" download="{filename}">📩 Bild speichern</a>'
-    return href
-
-# --- ARCHÄOLOGISCHE ANALYSE-FUNKTIONEN ---
-
+# --- ANALYSE-FUNKTIONEN ---
 def rasterize_points(df, res):
     cvs = ds.Canvas(
         plot_width=int((df.x.max() - df.x.min()) / res),
@@ -69,17 +105,12 @@ def calculate_hillshade(data, azimuth=315, angle_altitude=45, res=1.0):
             (np.sin(altitude_rad) * np.sin(slope) * np.cos(azimuth_rad - aspect))
     return ((shade + 1) / 2).astype(np.float32)
 
-def calculate_svf_approx(data, radius=5):
-    """Vereinfachte Annäherung des Sky View Factors via Lokaler Offenheit."""
-    def openness(x):
-        center = x[len(x)//2]
-        return np.mean(np.arctan((x - center) / radius))
-    
-    # Nutze Laplace als Proxy für schnelle Visualisierung von Kanten/Strukturen
-    # SVF ist rechenintensiv, daher hier eine Kombination aus Weichzeichnung und Differenz
-    smoothed = gaussian_filter(data, sigma=radius)
-    diff = data - smoothed
-    return np.clip((diff - diff.min()) / (diff.max() - diff.min()), 0, 1)
+def calculate_multi_hillshade(data, res=1.0):
+    h1 = calculate_hillshade(data, 315, 45, res)
+    h2 = calculate_hillshade(data, 45, 45, res)
+    h3 = calculate_hillshade(data, 135, 45, res)
+    h4 = calculate_hillshade(data, 225, 45, res)
+    return (h1 + h2 + h3 + h4) / 4.0
 
 def calculate_lrm(data, sigma=15):
     smoothed = gaussian_filter(data, sigma=sigma)
@@ -91,149 +122,139 @@ def calculate_lrm(data, sigma=15):
         return (res_clipped - res_min) / (res_max - res_min)
     return np.full_like(residual, 0.5)
 
+def calculate_slope(data, res=1.0):
+    gy, gx = np.gradient(data, res, res)
+    slope_deg = np.rad2deg(np.arctan(np.sqrt(gx**2 + gy**2)))
+    p_high = np.nanpercentile(slope_deg, 98)
+    return np.clip(slope_deg, 0, p_high)
+
+def calculate_curvature(data):
+    curv = -laplace(data)
+    p_low, p_high = np.percentile(curv, (2, 98))
+    curv_clipped = np.clip(curv, p_low, p_high)
+    c_min, c_max = curv_clipped.min(), curv_clipped.max()
+    if c_max > c_min:
+        return (curv_clipped - c_min) / (c_max - c_min)
+    return np.full_like(curv, 0.5)
+
 # --- SIDEBAR ---
 with st.sidebar:
-    st.title("🏛️ LiDAR Pro+")
-    uploaded_file = st.file_uploader("Daten (.xyz, .txt)", type=["xyz", "txt"])
+    st.header("⚙️ Parameter")
+    uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
     
     st.divider()
-    with st.expander("🌍 Geo-Referenz & Grid", expanded=True):
-        epsg_code = st.number_input("EPSG Code", value=25832)
-        grid_res = st.slider("Auflösung (m)", 0.2, 5.0, 1.0)
+    st.subheader("Geo-Referenz")
+    epsg_code = st.number_input("EPSG Code (UTM 32N: 25832)", value=25832)
     
-    with st.expander("🔍 Analyse-Optionen"):
-        lrm_sigma = st.slider("LRM Glättung", 5, 50, 15)
-        z_exag = st.slider("3D Überhöhung", 0.1, 5.0, 1.5)
-        
-    st.info("Hinweis: Große Dateien werden automatisch reduziert, um die Performance im Browser zu erhalten.")
+    st.divider()
+    st.subheader("Raster & Filter")
+    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
+    lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
+    
+    st.subheader("3D-Eigenschaften")
+    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
+    
+    view_mode = st.radio("Ansicht 2D:", ["Einzelansicht", "Gitter-Übersicht"])
 
 # --- HAUPTBEREICH ---
 if uploaded_file:
     try:
-        # 1. Daten laden (Caching für Speed)
-        @st.cache_data
-        def load_data(file):
-            data = pd.read_csv(file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
-            if len(data) > 1500000:
-                data = data.sample(1500000, random_state=42)
-            return data
+        df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
+        if len(df) > 2000000:
+            df = df.sample(2000000, random_state=42)
+            st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
 
-        df = load_data(uploaded_file)
-        
-        # Grid Info
         min_x, max_x = df.x.min(), df.x.max()
         min_y, max_y = df.y.min(), df.y.max()
         center_x, center_y = df.x.mean(), df.y.mean()
+        lat, lon = convert_coords(center_x, center_y, epsg_code)
+        
+        location_placeholder = st.empty()
+        if lat and lon:
+            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            location_placeholder.markdown(f"**📍 Standort:** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
 
-        with st.spinner("Berechne Modelle..."):
+        with st.spinner("Analysiere Gelände..."):
             gz = rasterize_points(df, grid_res)
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
-            # Modelle
-            hillshade = calculate_hillshade(gz, 315, 45, grid_res)
+            nw_h = calculate_hillshade(gz, 315, 45, grid_res)
+            mds = calculate_multi_hillshade(gz, grid_res)
             lrm = calculate_lrm(gz, lrm_sigma)
-            svf = calculate_svf_approx(gz)
-            slope = np.rad2deg(np.arctan(np.sqrt(np.square(np.gradient(gz, grid_res)[0]) + np.square(np.gradient(gz, grid_res)[1]))))
-            
-            # Composite (Der klassische Archäologie-Look)
-            composite = np.clip(hillshade * 0.7 + svf * 0.3, 0, 1)
+            slope = calculate_slope(gz, grid_res)
+            curv = calculate_curvature(gz)
+            comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
 
-            models = {
-                "Übersicht (Composite)": (composite, "gray"),
-                "Schummerung (Hillshade)": (hillshade, "gray"),
-                "Restrelief (LRM)": (lrm, "RdBu_r"),
-                "Struktur-Analyse (SVF-Proxy)": (svf, "bone"),
-                "Hangneigung": (slope, "inferno")
+            analysis_models = {
+                "Final Composite (Fusion)": (comp, "gray", False),
+                "NW Hillshade": (nw_h, "gray", False),
+                "MDS Composite": (mds, "gray", False),
+                "Restrelief (LRM)": (lrm, "RdBu", True),
+                "Hangneigung (Slope)": (slope, "plasma", True),
+                "Krümmung (Curvature)": (curv, "RdYlGn", True)
             }
 
-        # Layout Tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["🗺️ 2D Analyse", "📈 Profil-Schnitt", "🌐 3D Viewer", "📊 Metriken"])
+        tab1, tab2, tab3 = st.tabs(["🖼️ 2D-Analyse", "🤖 AI-Assistent", "🌐 3D-Prospektion"])
 
         with tab1:
-            st.subheader("Archäologische Gelände-Visualisierung")
-            sel_model = st.selectbox("Darstellungs-Modell:", list(models.keys()))
-            data, cmap = models[sel_model]
-            
-            fig, ax = plt.subplots(figsize=(12, 8))
-            im = ax.imshow(data, cmap=cmap, origin='lower', extent=[min_x, max_x, min_y, max_y])
-            plt.colorbar(im, ax=ax, shrink=0.6)
-            ax.set_title(sel_model)
-            st.pyplot(fig)
-            st.markdown(get_image_download_link(fig, f"{sel_model}.png"), unsafe_allow_html=True)
+            if view_mode == "Gitter-Übersicht":
+                c1, c2 = st.columns(2)
+                for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
+                    with [c1, c2][i % 2]:
+                        fig, ax = plt.subplots()
+                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
+                        ax.set_title(name)
+                        ax.axis('off')
+                        st.pyplot(fig)
+                        plt.close(fig)
+            else:
+                sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
+                data, cmap, _ = analysis_models[sel_2d]
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
+                ax.axis('off')
+                st.pyplot(fig)
+                st.session_state['current_fig'] = fig
+                st.session_state['current_model_name'] = sel_2d
 
         with tab2:
-            st.subheader("Interaktiver Profil-Schnitt")
-            st.write("Lege einen Schnitt durch das Gelände, um Strukturen zu vermessen.")
+            st.subheader("🤖 KI-Struktur-Erkennung")
+            st.write("Lassen Sie die Karte von einer KI auf archäologische Merkmale prüfen.")
             
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                p_orient = st.radio("Schnitt-Richtung", ["Horizontal (West-Ost)", "Vertikal (Süd-Nord)"])
-                if p_orient == "Horizontal (West-Ost)":
-                    slice_pos = st.slider("Y-Position wählen", float(min_y), float(max_y), float(center_y))
-                    # Finde Index
-                    idx = int((slice_pos - min_y) / (max_y - min_y) * (gz.shape[0]-1))
-                    profile_z = gz[idx, :]
-                    profile_x = np.linspace(min_x, max_x, len(profile_z))
-                else:
-                    slice_pos = st.slider("X-Position wählen", float(min_x), float(max_x), float(center_x))
-                    idx = int((slice_pos - min_x) / (max_x - min_x) * (gz.shape[1]-1))
-                    profile_z = gz[:, idx]
-                    profile_x = np.linspace(min_y, max_y, len(profile_z))
-
-            with col2:
-                fig_prof = go.Figure()
-                fig_prof.add_trace(go.Scatter(x=profile_x, y=profile_z, mode='lines', line=dict(color='firebrick', width=2)))
-                fig_prof.update_layout(title=f"Geländeprofil an Position {slice_pos:.2f}", xaxis_title="Meter", yaxis_title="Höhe (m)", height=400)
-                st.plotly_chart(fig_prof, use_container_width=True)
+            if 'current_fig' in st.session_state:
+                if st.button("🗺️ Aktuelle Ansicht analysieren"):
+                    with st.spinner("KI studiert die Karte..."):
+                        # Bild konvertieren
+                        buf = io.BytesIO()
+                        st.session_state['current_fig'].savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+                        img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                        
+                        # API Aufruf
+                        report = call_gemini_vision(img_base64, st.session_state['current_model_name'])
+                        
+                        st.markdown("### 📜 Archäologischer Vorbericht")
+                        st.write(report)
+            else:
+                st.info("Bitte wähle zuerst ein Modell im 2D-Tab (Einzelansicht) aus.")
 
         with tab3:
-            st.subheader("3D Prospektion")
-            # Downsampling für Performance
-            step = max(1, int(gz.shape[0] / 300))
-            z_3d = gz[::step, ::step]
-            tex_3d = composite[::step, ::step]
-            
-            x_range = np.linspace(min_x, max_x, z_3d.shape[1])
-            y_range = np.linspace(min_y, max_y, z_3d.shape[0])
+            selected_texture = st.selectbox("Textur für 3D:", list(analysis_models.keys()))
+            tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
+            step = max(1, int(np.sqrt(gz.size / 400000)))
+            z_plot = gz[::step, ::step]
+            surface_tex = tex_data[::step, ::step]
+            x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
+            y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
 
             fig3d = go.Figure(data=[go.Surface(
-                z=z_3d, x=x_range, y=y_range,
-                surfacecolor=tex_3d,
-                colorscale='gray'
+                x=x_vals, y=y_vals, z=z_plot, 
+                surfacecolor=surface_tex, colorscale=tex_cmap, showscale=show_scale,
+                lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5)
             )])
-            fig3d.update_layout(
-                scene=dict(aspectmode='manual', aspectratio=dict(x=1, y=1, z=z_exag/2)),
-                height=700, margin=dict(l=0, r=0, b=0, t=0)
-            )
+            fig3d.update_layout(scene=dict(aspectmode='data', aspectratio=dict(x=1, y=1, z=z_exag)), height=800)
             st.plotly_chart(fig3d, use_container_width=True)
 
-        with tab4:
-            st.subheader("Gelände-Statistik")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Min Höhe", f"{gz.min():.2f} m")
-            c2.metric("Max Höhe", f"{gz.max():.2f} m")
-            c3.metric("Ø Hangneigung", f"{slope.mean():.1f} °")
-            c4.metric("Fläche", f"{(max_x-min_x)*(max_y-min_y)/10000:.1f} ha")
-            
-            # Koordinaten
-            lat, lon = convert_coords(center_x, center_y, epsg_code)
-            if lat:
-                st.success(f"📍 Zentrum-Koordinaten (WGS84): {lat:.6f}, {lon:.6f}")
-                st.write(f"[In Google Maps öffnen](https://www.google.com/maps/search/?api=1&query={lat},{lon})")
-
     except Exception as e:
-        st.error(f"Fehler bei der Verarbeitung: {e}")
-        st.info("Bitte prüfe, ob die Datei das Format X Y Z (mit Leerzeichen oder Komma getrennt) hat.")
+        st.error(f"Fehler: {e}")
 else:
-    # Willkommensbildschirm
-    st.header("Willkommen beim LiDAR Archäologie-Analysetool")
-    st.markdown("""
-    Laden Sie eine `.xyz` oder `.txt` Datei mit Punktwolkendaten hoch, um fortzufahren.
-    
-    **Funktionen:**
-    - **Composite Visualisierung:** Kombiniert Schummerung und Struktur-Analyse.
-    - **LRM (Local Relief Model):** Entfernt großräumige Höhenunterschiede, um archäologische Merkmale (Wälle, Gräben) hervorzuheben.
-    - **SVF-Proxy:** Macht Strukturen unabhängig vom Sonnenstand sichtbar.
-    - **Profil-Tool:** Vermessen Sie Strukturen direkt im Browser.
-    """)
-    st.image("https://images.unsplash.com/photo-1510672981848-a1c4f1cb5ccf?auto=format&fit=crop&q=80&w=1000", caption="LiDAR ermöglicht den Blick durch das Blätterdach.")
+    st.info("Bitte XYZ-Datei hochladen.")
