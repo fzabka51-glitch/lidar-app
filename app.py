@@ -13,17 +13,12 @@ import time
 import os
 
 # --- API KONFIGURATION ---
-# Die Umgebung injiziert den Key in diese Variable. 
-# Falls nicht, versuchen wir ihn aus den Umgebungsvariablen zu laden.
+# WICHTIG: apiKey muss ein leerer String sein. 
+# Die Laufzeitumgebung füllt diesen Wert automatisch aus.
 apiKey = "" 
-if not apiKey:
-    apiKey = os.environ.get("GOOGLE_API_KEY", "")
 
 def call_gemini_vision(base64_image, analysis_type):
     """Sendet das Bild an Gemini zur archäologischen Analyse."""
-    if not apiKey:
-        return "Fehler: Kein API-Key gefunden. Bitte stellen Sie sicher, dass die Umgebung den Key bereitstellt."
-
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
     
     prompt = f"""
@@ -54,8 +49,7 @@ def call_gemini_vision(base64_image, analysis_type):
         }]
     }
 
-    # Exponential Backoff Implementierung
-    last_err = "Unbekannter Fehler"
+    # Exponential Backoff für API-Stabilität
     for delay in [1, 2, 4, 8, 16]:
         try:
             response = requests.post(url, json=payload, timeout=30)
@@ -65,15 +59,13 @@ def call_gemini_vision(base64_image, analysis_type):
             elif response.status_code == 429: # Rate Limit
                 time.sleep(delay)
                 continue
-            elif response.status_code == 403:
-                return f"Fehler 403: Zugriff verweigert. Dies liegt meist an einem fehlenden oder ungültigen API-Key in der aktuellen Umgebung. ({response.text})"
             else:
                 return f"Fehler: {response.status_code} - {response.text}"
         except Exception as e:
-            last_err = str(e)
             time.sleep(delay)
+            last_err = str(e)
     
-    return f"API-Verbindungsfehler nach mehreren Versuchen: {last_err}"
+    return f"API-Fehler: {last_err}"
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -227,7 +219,7 @@ if uploaded_file:
                 ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                 ax.axis('off')
                 st.pyplot(fig)
-                # Speichere die aktuellen Daten für die KI
+                
                 st.session_state['current_data'] = data
                 st.session_state['current_cmap'] = cmap
                 st.session_state['current_model_name'] = sel_2d
@@ -239,7 +231,6 @@ if uploaded_file:
             if 'current_data' in st.session_state:
                 if st.button("🗺️ Aktuelle Ansicht analysieren"):
                     with st.spinner("KI studiert die Karte..."):
-                        # Bild im Speicher erzeugen um es an die KI zu senden
                         fig_ai, ax_ai = plt.subplots(figsize=(8, 8))
                         ax_ai.imshow(st.session_state['current_data'], cmap=st.session_state['current_cmap'], origin='lower')
                         ax_ai.axis('off')
@@ -249,7 +240,6 @@ if uploaded_file:
                         plt.close(fig_ai)
                         img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
                         
-                        # API Aufruf
                         report = call_gemini_vision(img_base64, st.session_state['current_model_name'])
                         
                         st.markdown("### 📜 Archäologischer Vorbericht")
