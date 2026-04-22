@@ -20,12 +20,9 @@ apiKey = ""
 def call_gemini_vision(base64_image, analysis_type):
     """
     Sendet das Bild an Gemini zur archäologischen Analyse.
-    Verwendet gemini-2.5-flash-preview-09-2025 wie gefordert.
+    Verwendet gemini-2.5-flash-preview-09-2025 gemäß Spezifikation.
     """
-    # Falls der apiKey leer ist, versuchen wir als Fallback die Umgebungsvariable
-    active_key = apiKey if apiKey else os.environ.get("GOOGLE_API_KEY", "")
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={active_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
     
     prompt = f"""
     Du bist ein Experte für LiDAR-Archäologie. Analysiere dieses LiDAR-Geländemodell ({analysis_type}).
@@ -56,27 +53,24 @@ def call_gemini_vision(base64_image, analysis_type):
     }
 
     # Exponential Backoff für API-Stabilität (1s, 2s, 4s, 8s, 16s)
-    last_response_text = ""
+    last_err = ""
     for delay in [1, 2, 4, 8, 16]:
         try:
             response = requests.post(url, json=payload, timeout=30)
             if response.status_code == 200:
                 result = response.json()
-                # Extrahiere Text gemäß Spezifikation
                 return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Keine Analyse-Ergebnisse erhalten.")
             elif response.status_code == 429: # Rate Limit
                 time.sleep(delay)
                 continue
-            elif response.status_code == 403:
-                return "Fehler 403: API-Schlüssel fehlt oder ist ungültig. In dieser Umgebung sollte der Key automatisch bereitgestellt werden."
             else:
-                last_response_text = f"Status {response.status_code}: {response.text}"
+                last_err = f"Status {response.status_code}: {response.text}"
                 time.sleep(delay)
         except Exception as e:
-            last_response_text = str(e)
+            last_err = str(e)
             time.sleep(delay)
     
-    return f"API-Fehler nach mehreren Versuchen: {last_response_text}"
+    return f"KI-Analyse derzeit nicht möglich: {last_err}"
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -245,7 +239,7 @@ if uploaded_file:
 
         with tab2:
             st.subheader("🤖 KI-Struktur-Erkennung")
-            st.write("Lassen Sie die Karte von der KI (Gemini) auf archäologische Merkmale prüfen.")
+            st.write("Lassen Sie die Karte von der KI auf archäologische Merkmale prüfen.")
             
             if 'current_data' in st.session_state:
                 if st.button("🗺️ Aktuelle Ansicht analysieren"):
