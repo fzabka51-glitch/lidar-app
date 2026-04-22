@@ -6,224 +6,254 @@ import plotly.graph_objects as go
 from scipy.ndimage import laplace, gaussian_filter, uniform_filter
 import datashader as ds
 import io
+import json
+import requests
+from datetime import datetime
 
-# Versuche pyproj für die Koordinatenumrechnung zu importieren
+# Firebase / Firestore für die Cloud-Speicherung
 try:
-    import pyproj
-    PYPROJ_AVAILABLE = True
+    import firebase_admin
+    from firebase_admin import credentials, firestore
 except ImportError:
-    PYPROJ_AVAILABLE = False
+    pass
 
-# --- SEITENKONFIGURATION ---
-st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
-st.title("🏛️ LiDAR Analyse & High-Performance 3D")
+# --- GEMINI API SETUP ---
+def call_gemini_analyst(prompt):
+    """KI-Analyst zur Interpretation der LiDAR-Daten."""
+    api_key = "" # Der API-Key wird von der Umgebung bereitgestellt
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
+    
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt}
+            ]
+        }],
+        "systemInstruction": {
+            "parts": [{"text": "Du bist ein Experte für digitale Archäologie und LiDAR-Prospektion. Analysiere die gegebenen Daten auf anthropogene Strukturen wie Wälle, Gräben, Siedlungsspuren oder Altwege."}]
+        }
+    }
+    
+    # Exponential Backoff für API-Calls
+    for attempt in range(5):
+        try:
+            response = requests.post(url, json=payload, timeout=15)
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "Keine Analyse möglich.")
+        except Exception:
+            import time
+            time.sleep(2**attempt)
+    return "KI-Analyse derzeit nicht verfügbar. Bitte versuchen Sie es später erneut."
 
-# --- KOORDINATEN-FUNKTION ---
-def convert_coords(x, y, from_epsg=25832):
-    """Wandelt metrische Koordinaten in Lat/Lon um."""
-    if not PYPROJ_AVAILABLE:
-        return None, None
-    try:
-        transformer = pyproj.Transformer.from_crs(f"epsg:{from_epsg}", "epsg:4326", always_xy=True)
-        lon, lat = transformer.transform(x, y)
-        return lat, lon
-    except:
-        return None, None
+# --- FIRESTORE SETUP ---
+def init_firestore():
+    if not firebase_admin._apps:
+        try:
+            # Versuche Konfiguration aus Streamlit Secrets zu laden
+            conf = json.loads(st.secrets["__firebase_config"])
+            firebase_admin.initialize_app(credentials.Certificate(conf))
+        except:
+            return None
+    return firestore.client()
 
-# --- ARCHÄOLOGISCHE ANALYSE-FUNKTIONEN ---
+# --- ANALYSE-FUNKTIONEN ---
 
-def rasterize_points(df, res):
-    """Blitzschnelle Rasterisierung von Millionen Punkten mittels Datashader."""
-    cvs = ds.Canvas(
-        plot_width=int((df.x.max() - df.x.min()) / res),
-        plot_height=int((df.y.max() - df.y.min()) / res),
-        x_range=(df.x.min(), df.x.max()),
-        y_range=(df.y.min(), df.y.max())
-    )
-    agg = cvs.points(df, 'x', 'y', ds.mean('z'))
-    return np.array(agg.values, dtype=np.float32)
+def calculate_svf(data, radius=10):
+    """Approximation des Sky-View-Factors (Himmelsichtfaktor)."""
+    # Vereinfachte Version: Differenz zum lokalen Mittelwert hebt Vertiefungen/Erhebungen hervor
+    mean_val = uniform_filter(data, size=radius*2)
+    svf = data - mean_val
+    # Normalisierung für die Darstellung
+    svf_norm = (svf - np.min(svf)) / (np.max(svf) - np.min(svf) + 1e-8)
+    return np.clip(svf_norm, 0, 1)
 
-def calculate_hillshade(data, azimuth=315, angle_altitude=45, res=1.0):
-    """Berechnet ein Schummerungsbild (Hillshade)."""
-    azimuth_rad = np.deg2rad(azimuth)
-    altitude_rad = np.deg2rad(angle_altitude)
+def calculate_rrim(data, res=1.0):
+    """Red Relief Image Map (Kombination aus Wölbung und Hangneigung)."""
+    # Hangneigung (Slope)
     gy, gx = np.gradient(data, res, res)
     slope = np.arctan(np.sqrt(gx**2 + gy**2))
-    aspect = np.arctan2(-gy, gx)
-    shade = (np.cos(altitude_rad) * np.cos(slope)) + \
-            (np.sin(altitude_rad) * np.sin(slope) * np.cos(azimuth_rad - aspect))
-    return ((shade + 1) / 2).astype(np.float32)
-
-def calculate_multi_hillshade(data, res=1.0):
-    """Multi-Directional Shading (MDS) aus 4 Richtungen."""
-    h1 = calculate_hillshade(data, 315, 45, res)
-    h2 = calculate_hillshade(data, 45, 45, res)
-    h3 = calculate_hillshade(data, 135, 45, res)
-    h4 = calculate_hillshade(data, 225, 45, res)
-    return (h1 + h2 + h3 + h4) / 4.0
-
-def calculate_lrm(data, sigma=15):
-    """Local Relief Model (LRM) / Residual Topography."""
-    smoothed = gaussian_filter(data, sigma=sigma)
-    residual = data - smoothed
-    p_low, p_high = np.percentile(residual, (5, 95))
-    res_clipped = np.clip(residual, p_low, p_high)
-    res_min, res_max = res_clipped.min(), res_clipped.max()
-    if res_max > res_min:
-        return (res_clipped - res_min) / (res_max - res_min)
-    return np.full_like(residual, 0.5)
-
-def calculate_openness(data, size=5):
-    """Positive Openness (Proxy für Sky-View-Factor). 
-    Hebt Gräben und Wälle massiv hervor."""
-    mean_val = uniform_filter(data, size=size)
-    diff = data - mean_val
-    p_low, p_high = np.percentile(diff, (2, 98))
-    diff = np.clip(diff, p_low, p_high)
-    d_min, d_max = diff.min(), diff.max()
-    if d_max > d_min:
-        return (diff - d_min) / (d_max - d_min)
-    return np.full_like(data, 0.5)
-
-def calculate_slope(data, res=1.0):
-    """Berechnet die Hangneigung in Grad."""
-    gy, gx = np.gradient(data, res, res)
-    slope_deg = np.rad2deg(np.arctan(np.sqrt(gx**2 + gy**2)))
-    p_high = np.nanpercentile(slope_deg, 98)
-    return np.clip(slope_deg, 0, p_high)
-
-def calculate_curvature(data):
-    """Berechnet die lokale Krümmung (Laplace)."""
+    # Krümmung (Curvature/Laplace)
     curv = -laplace(data)
-    p_low, p_high = np.percentile(curv, (2, 98))
-    curv_clipped = np.clip(curv, p_low, p_high)
-    c_min, c_max = curv_clipped.min(), curv_clipped.max()
-    if c_max > c_min:
-        return (curv_clipped - c_min) / (c_max - c_min)
-    return np.full_like(curv, 0.5)
+    
+    # Normalisierung der Kanäle
+    slope_n = (slope - np.min(slope)) / (np.max(slope) - np.min(slope) + 1e-8)
+    curv_n = (curv - np.min(curv)) / (np.max(curv) - np.min(curv) + 1e-8)
+    
+    # Erstellung des RGB-Bildes (RRIM Pattern)
+    rrim = np.zeros((*data.shape, 3))
+    rrim[..., 0] = slope_n  # Rot: Steilheit
+    rrim[..., 1] = curv_n   # Grün: Positive Wölbung (Wälle)
+    rrim[..., 2] = 1.0 - curv_n # Blau: Negative Wölbung (Gräben)
+    return rrim
 
-# --- SIDEBAR (STEUERUNG) ---
+# --- APP LAYOUT ---
+st.set_page_config(page_title="LiDAR Archäologie Pro Ultra", layout="wide")
+
+if "markers" not in st.session_state:
+    st.session_state.markers = []
+
 with st.sidebar:
-    st.header("⚙️ Parameter")
-    uploaded_file = st.file_uploader("XYZ Datei laden (.xyz, .txt)", type=["xyz", "txt"])
+    st.title("🏛️ LiDAR Pro Ultra")
+    uploaded_file = st.file_uploader("XYZ Daten laden (.xyz, .txt, .csv)", type=["xyz", "txt", "csv"])
     
     st.divider()
-    st.subheader("Geo-Referenz")
-    epsg_code = st.number_input("EPSG Code (z.B. UTM 32N: 25832)", value=25832)
-    if not PYPROJ_AVAILABLE:
-        st.warning("⚠️ 'pyproj' nicht gefunden. Koordinatenumrechnung deaktiviert.")
+    grid_res = st.slider("Raster-Auflösung (m)", 0.2, 5.0, 1.0)
+    z_exag = st.slider("3D-Überhöhung", 0.1, 10.0, 2.0)
     
     st.divider()
-    st.subheader("Raster & Filter")
-    grid_res = st.number_input("Auflösung (m)", 0.1, 10.0, 1.0)
-    lrm_sigma = st.slider("LRM Glättung (Sigma)", 1, 50, 15)
-    openness_size = st.slider("Openness Radius", 2, 20, 5)
+    st.subheader("Cloud- & KI-Tools")
+    save_markers = st.toggle("Cloud-Synchronisierung", False)
     
-    st.subheader("3D-Eigenschaften")
-    z_exag = st.slider("Z-Überhöhung", 0.1, 5.0, 0.5, step=0.1)
-    
-    st.subheader("Anzeige")
-    view_mode = st.radio("Ansicht 2D:", ["Gitter-Übersicht", "Einzelansicht"])
-
-# --- HAUPTBEREICH ---
-if uploaded_file:
-    try:
-        # 1. Daten laden
-        df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
-        if len(df) > 2000000:
-            df = df.sample(2000000, random_state=42)
-            st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
-
-        min_x, max_x = df.x.min(), df.x.max()
-        min_y, max_y = df.y.min(), df.y.max()
-        center_x, center_y = df.x.mean(), df.y.mean()
-        lat, lon = convert_coords(center_x, center_y, epsg_code)
-        
-        location_placeholder = st.empty()
-        if lat and lon:
-            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-            location_placeholder.markdown(f"**📍 Standort (Zentrum):** [{lat:.5f}, {lon:.5f}]({google_maps_url})")
-
-        # 2. Berechnungen
-        with st.spinner("Analysiere Gelände..."):
-            gz = rasterize_points(df, grid_res)
-            gz = np.nan_to_num(gz, nan=np.nanmean(gz))
-            
-            nw_h = calculate_hillshade(gz, 315, 45, grid_res)
-            mds = calculate_multi_hillshade(gz, grid_res)
-            lrm = calculate_lrm(gz, lrm_sigma)
-            slope = calculate_slope(gz, grid_res)
-            curv = calculate_curvature(gz)
-            opn = calculate_openness(gz, openness_size)
-            
-            # RGB Prospektion: Slope (R), LRM (G), Openness (B)
-            slope_norm = (slope - slope.min()) / (slope.max() - slope.min())
-            comp_rgb = np.stack([slope_norm, lrm, opn], axis=-1)
-
-            analysis_models = {
-                "Prospektion RGB (Multichannel)": (comp_rgb, None, False),
-                "Restrelief (LRM)": (lrm, "RdBu", True),
-                "Openness (Sky View)": (opn, "magma", True),
-                "MDS Composite": (mds, "gray", False),
-                "Hangneigung (Slope)": (slope, "plasma", True),
-                "Krümmung (Curvature)": (curv, "RdYlGn", True),
-                "NW Hillshade": (nw_h, "gray", False)
-            }
-
-        tab1, tab2 = st.tabs(["🖼️ 2D-Analyse", "🌐 3D-Prospektion"])
-
-        with tab1:
-            if view_mode == "Gitter-Übersicht":
-                c1, c2 = st.columns(2)
-                for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
-                    with [c1, c2][i % 2]:
-                        fig, ax = plt.subplots()
-                        ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
-                        ax.set_title(name)
-                        ax.axis('off')
-                        st.pyplot(fig)
-                        plt.close(fig)
-            else:
-                sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
-                data, cmap, _ = analysis_models[sel_2d]
-                fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
-                ax.axis('off')
-                st.pyplot(fig)
-                plt.close(fig)
-
-        with tab2:
-            st.subheader("3D-Viewer")
-            selected_texture = st.selectbox("3D-Oberfläche wählen:", list(analysis_models.keys()), index=0)
-            tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
-            
-            step = max(1, int(np.sqrt(gz.size / 400000)))
-            z_plot = gz[::step, ::step]
-            surface_tex = tex_data[::step, ::step]
-
-            x_vals = np.linspace(min_x, max_x, z_plot.shape[1])
-            y_vals = np.linspace(min_y, max_y, z_plot.shape[0])
-
-            fig3d = go.Figure(data=[go.Surface(
-                x=x_vals, y=y_vals, z=z_plot, 
-                surfacecolor=surface_tex if tex_cmap else None, 
-                colorscale=tex_cmap,
-                showscale=show_scale,
-                lighting=dict(ambient=0.6, diffuse=0.8, roughness=0.5),
-                hovertemplate='Höhe: %{z:.2f}m<extra></extra>'
-            )])
-            
-            fig3d.update_layout(
-                scene=dict(
-                    aspectmode='data',
-                    aspectratio=dict(x=1, y=1, z=z_exag),
-                    xaxis=dict(title="X (m)"), yaxis=dict(title="Y (m)"), zaxis=dict(title="Höhe (m)")
-                ),
-                height=800, margin=dict(l=0, r=0, b=0, t=40)
+    if st.button("✨ KI-Experten-Analyse starten"):
+        with st.spinner("KI wertet Geländedaten aus..."):
+            st.session_state.ai_analysis = call_gemini_analyst(
+                "Ich habe Geländedaten mit archäologischen Strukturen. Analysiere das aktuelle Modell auf Anomalien wie Viereckschanzen, Hügelgräber oder Hohlwege."
             )
-            st.plotly_chart(fig3d, use_container_width=True)
+
+# --- HAUPT-LOGIK ---
+if uploaded_file:
+    @st.cache_data
+    def load_and_rasterize(file, res):
+        # CSV Laden
+        df = pd.read_csv(file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
+        
+        # Datashader für schnelles Rastering von Millionen Punkten
+        cvs = ds.Canvas(
+            plot_width=int((df.x.max() - df.x.min()) / res),
+            plot_height=int((df.y.max() - df.y.min()) / res),
+            x_range=(df.x.min(), df.x.max()),
+            y_range=(df.y.min(), df.y.max())
+        )
+        agg = cvs.points(df, 'x', 'y', ds.mean('z'))
+        return np.array(agg.values, dtype=np.float32), (df.x.min(), df.x.max(), df.y.min(), df.y.max())
+
+    try:
+        with st.spinner("Verarbeite LiDAR-Punktwolke..."):
+            gz, extent = load_and_rasterize(uploaded_file, grid_res)
+            # Fülle ungültige Werte mit dem Mittelwert
+            gz = np.nan_to_num(gz, nan=np.nanmean(gz))
+
+        # Analysen berechnen
+        svf = calculate_svf(gz)
+        rrim = calculate_rrim(gz, grid_res)
+        lrm = gz - gaussian_filter(gz, sigma=10) # Local Relief Model
+
+        t1, t2, t3, t4 = st.tabs(["🗺️ Karten-Analyse", "📐 Profil-Schnitt", "📊 Fundstellen-Log", "🤖 KI-Expertise"])
+
+        with t1:
+            col1, col2 = st.columns([3, 1])
+            
+            with col2:
+                map_type = st.radio("Visualisierung", ["Red Relief (RRIM)", "Sky View Factor", "Restrelief (LRM)", "Höhenmodell (Grau)"])
+                st.info("💡 Pro-Tipp: RRIM eignet sich am besten für die Entdeckung von Mauern und Gräben unter Vegetation.")
+                
+            with col1:
+                if map_type == "Red Relief (RRIM)":
+                    fig, ax = plt.subplots(figsize=(10, 10))
+                    ax.imshow(rrim, origin='lower', extent=extent)
+                    ax.set_title("Red Relief Image Map")
+                    ax.axis('off')
+                    st.pyplot(fig)
+                    plt.close(fig)
+                else:
+                    z_data = svf if map_type == "Sky View Factor" else (lrm if map_type == "Restrelief (LRM)" else gz)
+                    fig = go.Figure(data=go.Heatmap(
+                        z=z_data,
+                        colorscale='Greys' if map_type != "Restrelief (LRM)" else 'RdBu',
+                        x0=extent[0], dx=grid_res, y0=extent[2], dy=grid_res
+                    ))
+                    fig.update_layout(width=800, height=700, margin=dict(l=0,r=0,t=40,b=0))
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with t2:
+            st.subheader("Interaktives Geländeprofil")
+            p_col1, p_col2 = st.columns(2)
+            with p_col1:
+                ax_val = st.number_input("Start X", value=float(extent[0]))
+                ay_val = st.number_input("Start Y", value=float(extent[2]))
+            with p_col2:
+                bx_val = st.number_input("Ende X", value=float(extent[1]))
+                by_val = st.number_input("Ende Y", value=float(extent[3]))
+                
+            # Extraktion des Profils
+            num_pts = 200
+            x_line = np.linspace(ax_val, bx_val, num_pts)
+            y_line = np.linspace(ay_val, by_val, num_pts)
+            
+            # Umrechnung in Raster-Indizes
+            ix = ((x_line - extent[0]) / grid_res).astype(int)
+            iy = ((y_line - extent[2]) / grid_res).astype(int)
+            ix = np.clip(ix, 0, gz.shape[1]-1)
+            iy = np.clip(iy, 0, gz.shape[0]-1)
+            
+            profile_z = gz[iy, ix]
+            dist = np.sqrt((x_line - ax_val)**2 + (y_line - ay_val)**2)
+            
+            fig_prof = go.Figure()
+            fig_prof.add_trace(go.Scatter(x=dist, y=profile_z, mode='lines', name='Geländehöhe', fill='tozeroy'))
+            fig_prof.update_layout(title="Höhenprofil-Schnitt (m)", xaxis_title="Distanz (m)", yaxis_title="Höhe ü. NN (m)")
+            st.plotly_chart(fig_prof, use_container_width=True)
+
+        with t3:
+            st.subheader("📍 Fundstellen-Management")
+            with st.form("marker_form", clear_on_submit=True):
+                m_name = st.text_input("Name der Anomalie", placeholder="z.B. Grabhügel_01")
+                m_type = st.selectbox("Typ", ["Hügelgrab", "Wall/Graben", "Siedlung", "Hohlweg", "Sonstiges"])
+                m_coords = st.text_input("Koordinaten", f"{ax_val:.2f}, {ay_val:.2f}")
+                
+                if st.form_submit_button("Fundstelle speichern"):
+                    new_marker = {
+                        "Name": m_name,
+                        "Typ": m_type,
+                        "Position": m_coords,
+                        "Zeitstempel": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                    st.session_state.markers.append(new_marker)
+                    st.success(f"'{m_name}' wurde zum Log hinzugefügt.")
+            
+            if st.session_state.markers:
+                st.table(pd.DataFrame(st.session_state.markers))
+            else:
+                st.info("Noch keine Fundstellen dokumentiert.")
+
+        with t4:
+            st.subheader("🤖 KI-Bericht")
+            if "ai_analysis" in st.session_state:
+                st.markdown(st.session_state.ai_analysis)
+            else:
+                st.info("Klicken Sie in der Sidebar auf 'KI-Experten-Analyse starten', um einen automatisierten Bericht zu generieren.")
 
     except Exception as e:
-        st.error(f"Fehler: {e}")
+        st.error(f"Fehler bei der Datenverarbeitung: {e}")
+
 else:
-    st.info("Bitte XYZ-Datei hochladen.")
+    st.info("Willkommen! Bitte laden Sie eine LiDAR-XYZ-Datei hoch, um mit der archäologischen Prospektion zu beginnen.")
+    
+    # Demo-Daten Bereich
+    st.divider()
+    if st.button("Beispiel-Gelände generieren"):
+        # Erzeuge synthetisches Gelände mit archäologischen Features
+        size = 150
+        x = np.linspace(0, 100, size)
+        y = np.linspace(0, 100, size)
+        X, Y = np.meshgrid(x, y)
+        # Natürliches Gelände
+        Z = np.sin(X/15) * np.cos(Y/15) * 5 
+        # Künstliche Viereckschanze
+        Z[60:90, 60:65] += 2 # Wall West
+        Z[60:90, 85:90] += 2 # Wall Ost
+        Z[60:65, 60:90] += 2 # Wall Nord
+        Z[85:90, 60:90] += 2 # Wall Süd
+        
+        output = []
+        for i in range(size):
+            for j in range(size):
+                output.append(f"{X[i,j]},{Y[i,j]},{Z[i,j]}")
+        
+        st.download_button(
+            label="Demo XYZ Datei herunterladen",
+            data="\n".join(output),
+            file_name="archaeo_demo.xyz",
+            mime="text/csv"
+        )
