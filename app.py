@@ -18,8 +18,14 @@ import os
 apiKey = "" 
 
 def call_gemini_vision(base64_image, analysis_type):
-    """Sendet das Bild an Gemini zur archäologischen Analyse."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
+    """
+    Sendet das Bild an Gemini zur archäologischen Analyse.
+    Verwendet gemini-2.5-flash-preview-09-2025 wie gefordert.
+    """
+    # Falls der apiKey leer ist, versuchen wir als Fallback die Umgebungsvariable
+    active_key = apiKey if apiKey else os.environ.get("GOOGLE_API_KEY", "")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={active_key}"
     
     prompt = f"""
     Du bist ein Experte für LiDAR-Archäologie. Analysiere dieses LiDAR-Geländemodell ({analysis_type}).
@@ -49,23 +55,28 @@ def call_gemini_vision(base64_image, analysis_type):
         }]
     }
 
-    # Exponential Backoff für API-Stabilität
+    # Exponential Backoff für API-Stabilität (1s, 2s, 4s, 8s, 16s)
+    last_response_text = ""
     for delay in [1, 2, 4, 8, 16]:
         try:
             response = requests.post(url, json=payload, timeout=30)
             if response.status_code == 200:
                 result = response.json()
-                return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Keine Analyse möglich.")
+                # Extrahiere Text gemäß Spezifikation
+                return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Keine Analyse-Ergebnisse erhalten.")
             elif response.status_code == 429: # Rate Limit
                 time.sleep(delay)
                 continue
+            elif response.status_code == 403:
+                return "Fehler 403: API-Schlüssel fehlt oder ist ungültig. In dieser Umgebung sollte der Key automatisch bereitgestellt werden."
             else:
-                return f"Fehler: {response.status_code} - {response.text}"
+                last_response_text = f"Status {response.status_code}: {response.text}"
+                time.sleep(delay)
         except Exception as e:
+            last_response_text = str(e)
             time.sleep(delay)
-            last_err = str(e)
     
-    return f"API-Fehler: {last_err}"
+    return f"API-Fehler nach mehreren Versuchen: {last_response_text}"
 
 # Versuche pyproj für die Koordinatenumrechnung zu importieren
 try:
@@ -164,9 +175,16 @@ with st.sidebar:
 # --- HAUPTBEREICH ---
 if uploaded_file:
     try:
-        df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
+        # Daten laden (Caching für Speed)
+        @st.cache_data
+        def load_data(file):
+            data = pd.read_csv(file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
+            if len(data) > 2000000:
+                data = data.sample(2000000, random_state=42)
+            return data
+
+        df = load_data(uploaded_file)
         if len(df) > 2000000:
-            df = df.sample(2000000, random_state=42)
             st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
 
         min_x, max_x = df.x.min(), df.x.max()
@@ -220,17 +238,19 @@ if uploaded_file:
                 ax.axis('off')
                 st.pyplot(fig)
                 
+                # State Management für KI-Tab
                 st.session_state['current_data'] = data
                 st.session_state['current_cmap'] = cmap
                 st.session_state['current_model_name'] = sel_2d
 
         with tab2:
             st.subheader("🤖 KI-Struktur-Erkennung")
-            st.write("Lassen Sie die Karte von einer KI auf archäologische Merkmale prüfen.")
+            st.write("Lassen Sie die Karte von der KI (Gemini) auf archäologische Merkmale prüfen.")
             
             if 'current_data' in st.session_state:
                 if st.button("🗺️ Aktuelle Ansicht analysieren"):
                     with st.spinner("KI studiert die Karte..."):
+                        # Karte in ein Bild im Speicher umwandeln
                         fig_ai, ax_ai = plt.subplots(figsize=(8, 8))
                         ax_ai.imshow(st.session_state['current_data'], cmap=st.session_state['current_cmap'], origin='lower')
                         ax_ai.axis('off')
@@ -240,16 +260,19 @@ if uploaded_file:
                         plt.close(fig_ai)
                         img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
                         
+                        # KI-Aufruf
                         report = call_gemini_vision(img_base64, st.session_state['current_model_name'])
                         
                         st.markdown("### 📜 Archäologischer Vorbericht")
                         st.info(report)
             else:
-                st.info("Bitte wähle zuerst ein Modell im 2D-Tab (Einzelansicht) aus.")
+                st.info("Bitte wähle zuerst ein Modell im Tab '2D-Analyse' (Einzelansicht) aus.")
 
         with tab3:
-            selected_texture = st.selectbox("Textur für 3D:", list(analysis_models.keys()))
+            selected_texture = st.selectbox("Textur für die 3D-Oberfläche:", list(analysis_models.keys()))
             tex_data, tex_cmap, show_scale = analysis_models[selected_texture]
+            
+            # Downsampling für flüssige 3D-Performance
             step = max(1, int(np.sqrt(gz.size / 400000)))
             z_plot = gz[::step, ::step]
             surface_tex = tex_data[::step, ::step]
@@ -261,10 +284,20 @@ if uploaded_file:
                 surfacecolor=surface_tex, colorscale=tex_cmap, showscale=show_scale,
                 lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5)
             )])
-            fig3d.update_layout(scene=dict(aspectmode='data', aspectratio=dict(x=1, y=1, z=z_exag)), height=800)
+            fig3d.update_layout(
+                scene=dict(
+                    aspectmode='data', 
+                    aspectratio=dict(x=1, y=1, z=z_exag),
+                    xaxis=dict(title="X (m)"),
+                    yaxis=dict(title="Y (m)"),
+                    zaxis=dict(title="Höhe (m)")
+                ), 
+                height=800,
+                margin=dict(l=0, r=0, b=0, t=40)
+            )
             st.plotly_chart(fig3d, use_container_width=True)
 
     except Exception as e:
-        st.error(f"Fehler: {e}")
+        st.error(f"Ein Fehler ist aufgetreten: {e}")
 else:
-    st.info("Bitte XYZ-Datei hochladen.")
+    st.info("Bitte lade eine XYZ-Punktwolkendatei hoch, um die Analyse zu starten.")
