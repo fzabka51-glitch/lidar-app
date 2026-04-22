@@ -21,9 +21,14 @@ def call_gemini_vision(base64_image, analysis_type):
     Sendet das Bild an Gemini zur archäologischen Analyse.
     Verwendet gemini-2.5-flash-preview-09-2025 für Image Understanding.
     """
-    # Wir verwenden apiKey direkt ohne manuelle Validierung,
-    # da die Umgebung diesen Wert zur Laufzeit füllt.
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
+    # Wir verwenden den apiKey, der von der Umgebung injiziert werden sollte.
+    # Falls die Injektion fehlschlägt, versuchen wir zusätzlich den Key aus der Umgebung zu lesen.
+    active_key = apiKey if apiKey else os.environ.get("GOOGLE_API_KEY", "")
+    
+    if not active_key:
+        return "⚠️ Fehler: Der API-Schlüssel konnte nicht geladen werden. Bitte laden Sie die Seite neu (F5), damit der Schlüssel vom System injiziert werden kann."
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={active_key}"
     
     prompt_text = f"""Analysiere dieses LiDAR-Geländemodell ({analysis_type}).
     Suche nach anthropogenen (menschengemachten) Strukturen wie:
@@ -33,9 +38,10 @@ def call_gemini_vision(base64_image, analysis_type):
     4. Siedlungsreste (rechteckige Strukturen)
     5. Landwirtschaftliche Spuren (Wölbäcker)
 
-    Beschreibe auffällige Merkmale und gib eine fachliche Einschätzung ab (Deutsch)."""
+    Beschreibe auffällige Merkmale und gib eine fachliche Einschätzung ab (Deutsch).
+    Antworte kurz und präzise."""
 
-    # Payload gemäß technischer Spezifikation
+    # Payload gemäß technischer Spezifikation für Image Understanding
     payload = {
         "contents": [{
             "role": "user",
@@ -52,24 +58,28 @@ def call_gemini_vision(base64_image, analysis_type):
     }
 
     # Exponential Backoff Implementierung (1s, 2s, 4s, 8s, 16s)
-    last_error = "Keine Antwort erhalten."
+    last_response = "Keine Antwort erhalten."
     for delay in [1, 2, 4, 8, 16]:
         try:
             response = requests.post(url, json=payload, timeout=60)
             if response.status_code == 200:
                 result = response.json()
-                return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "Keine Antwort vom Modell.")
-            elif response.status_code == 429:
+                text_content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                return text_content if text_content else "Die KI hat das Bild gesehen, konnte aber keinen Text generieren."
+            elif response.status_code == 429: # Rate Limit
                 time.sleep(delay)
                 continue
+            elif response.status_code == 403:
+                # Spezifische Meldung für den 403 Fehler
+                return f"🚫 Fehler 403: Zugriff verweigert. Die Umgebung hat den API-Schlüssel noch nicht freigeschaltet. Bitte warten Sie einen Moment und versuchen Sie es erneut oder laden Sie die Seite neu."
             else:
-                last_error = f"Status {response.status_code}: {response.text}"
+                last_response = f"Status {response.status_code}: {response.text}"
                 time.sleep(delay)
         except Exception as e:
-            last_error = str(e)
+            last_response = str(e)
             time.sleep(delay)
     
-    return f"KI-Analyse fehlgeschlagen nach mehreren Versuchen. Fehlerdetails: {last_error}"
+    return f"KI-Analyse fehlgeschlagen. Details: {last_response}"
 
 # --- HILFSFUNKTIONEN ---
 
@@ -129,56 +139,66 @@ with st.sidebar:
 
 if uploaded_file:
     try:
-        df = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
-        if len(df) > 1500000:
-            df = df.sample(1500000, random_state=42)
-            st.warning("Datensatz auf 1.5 Mio. Punkte reduziert.")
+        # Daten laden (Caching für Speed)
+        @st.cache_data
+        def load_lidar_data(file):
+            data = pd.read_csv(file, sep=None, engine='python', header=None, names=['x','y','z'], dtype=np.float32)
+            if len(data) > 1500000:
+                data = data.sample(1500000, random_state=42)
+            return data
 
-        with st.spinner("Modelle werden berechnet..."):
+        df = load_lidar_data(uploaded_file)
+        if len(df) >= 1500000:
+            st.warning("⚠️ Datensatz auf 1.5 Mio. Punkte reduziert für bessere Performance.")
+
+        with st.spinner("Geländemodelle werden berechnet..."):
             gz = rasterize_points(df, grid_res)
             gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
             hill = calculate_hillshade(gz, 315, 45, grid_res)
             lrm = calculate_lrm(gz, lrm_sigma)
-            # Einfache Fusion für bessere Sichtbarkeit
+            # Fusion für optimale KI-Sichtbarkeit
             fusion = np.clip(hill * 0.7 + lrm * 0.3, 0, 1)
 
             models = {
                 "Schummerung (Hillshade)": (hill, "gray"),
                 "Restrelief (LRM)": (lrm, "RdBu_r"),
-                "Fusion (Empfohlen für KI)": (fusion, "gray")
+                "Fusion (Optimiert für KI)": (fusion, "gray")
             }
 
         t1, t2, t3 = st.tabs(["🖼️ 2D Analyse", "🤖 KI Assistent", "🌐 3D Prospektion"])
 
         with t1:
-            sel = st.selectbox("Modell wählen", list(models.keys()), index=2)
+            sel = st.selectbox("Modell für die Anzeige wählen:", list(models.keys()), index=2)
             data, cmap = models[sel]
             fig, ax = plt.subplots(figsize=(10, 7))
             ax.imshow(data, cmap=cmap, origin='lower')
             ax.axis('off')
             st.pyplot(fig)
-            st.session_state['current_img'] = fig
-            st.session_state['current_name'] = sel
+            
+            # Bild direkt als Base64 in den Session State speichern (stabiler als Figure-Objekte)
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+            plt.close(fig)
+            st.session_state['last_img_b64'] = base64.b64encode(buf.getvalue()).decode()
+            st.session_state['current_model_name'] = sel
 
         with t2:
-            st.subheader("KI-Struktur-Erkennung")
-            st.write("Die KI analysiert das aktuell gewählte 2D-Modell.")
-            if st.button("🚀 Analyse starten"):
-                if 'current_img' in st.session_state:
-                    with st.spinner("KI analysiert das Gelände..."):
-                        buf = io.BytesIO()
-                        st.session_state['current_img'].savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
-                        plt.close(st.session_state['current_img'])
-                        b64 = base64.b64encode(buf.getvalue()).decode()
-                        
-                        report = call_gemini_vision(b64, st.session_state['current_name'])
+            st.subheader("🤖 KI-Struktur-Erkennung")
+            st.write("Die KI analysiert die im 2D-Tab gewählte Karte auf archäologische Spuren.")
+            
+            if st.button("🚀 Analyse der aktuellen Karte starten"):
+                if 'last_img_b64' in st.session_state:
+                    with st.spinner("Die KI (Gemini) studiert das Gelände..."):
+                        report = call_gemini_vision(st.session_state['last_img_b64'], st.session_state['current_model_name'])
+                        st.markdown("### 📜 Bericht der KI")
                         st.info(report)
                 else:
-                    st.warning("Bitte wählen Sie zuerst ein Modell im 2D-Tab.")
+                    st.warning("Bitte öffnen Sie zuerst den Tab '2D Analyse', um die Karte zu laden.")
 
         with t3:
             st.subheader("Interaktive 3D-Ansicht")
+            # Downsampling für flüssige 3D-Navigation
             step = max(1, int(np.sqrt(gz.size / 400000)))
             z_plot = gz[::step, ::step]
             tex_plot = fusion[::step, ::step]
@@ -187,10 +207,20 @@ if uploaded_file:
                 z=z_plot, surfacecolor=tex_plot, colorscale='gray',
                 lighting=dict(ambient=0.6, diffuse=0.8, roughness=0.5)
             )])
-            fig3d.update_layout(scene=dict(aspectmode='data', aspectratio=dict(x=1, y=1, z=z_exag)), height=700)
+            fig3d.update_layout(
+                scene=dict(
+                    aspectmode='data', 
+                    aspectratio=dict(x=1, y=1, z=z_exag),
+                    xaxis=dict(title="X (m)"),
+                    yaxis=dict(title="Y (m)"),
+                    zaxis=dict(title="Höhe (m)")
+                ), 
+                height=700,
+                margin=dict(l=0, r=0, b=0, t=0)
+            )
             st.plotly_chart(fig3d, use_container_width=True)
 
     except Exception as e:
-        st.error(f"Fehler: {e}")
+        st.error(f"⚠️ Ein Fehler ist aufgetreten: {e}")
 else:
-    st.info("Bitte laden Sie eine LiDAR-Datei (.xyz) hoch.")
+    st.info("👋 Willkommen! Bitte laden Sie eine LiDAR-Datei (.xyz) in der Seitenleiste hoch, um die archäologische Analyse zu starten.")
