@@ -21,13 +21,9 @@ def call_gemini_vision(base64_image, analysis_type):
     Sendet das Bild an Gemini zur archäologischen Analyse.
     Verwendet gemini-2.5-flash-preview-09-2025 für Image Understanding.
     """
-    # Falls der apiKey nach der Injektion immer noch leer ist, versuchen wir die Umgebungsvariable
-    actual_key = apiKey if apiKey else os.environ.get("GOOGLE_API_KEY", "")
-    
-    if not actual_key:
-        return "Fehler: Kein API-Schlüssel verfügbar. Bitte laden Sie die Seite neu oder prüfen Sie die Umgebung."
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={actual_key}"
+    # Wir verwenden apiKey direkt ohne manuelle Validierung,
+    # da die Umgebung diesen Wert zur Laufzeit füllt.
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={apiKey}"
     
     prompt_text = f"""Analysiere dieses LiDAR-Geländemodell ({analysis_type}).
     Suche nach anthropogenen (menschengemachten) Strukturen wie:
@@ -39,7 +35,7 @@ def call_gemini_vision(base64_image, analysis_type):
 
     Beschreibe auffällige Merkmale und gib eine fachliche Einschätzung ab (Deutsch)."""
 
-    # Payload exakt nach Spezifikation für Image Understanding
+    # Payload gemäß technischer Spezifikation
     payload = {
         "contents": [{
             "role": "user",
@@ -55,7 +51,8 @@ def call_gemini_vision(base64_image, analysis_type):
         }]
     }
 
-    # Exponential Backoff (1s, 2s, 4s, 8s, 16s)
+    # Exponential Backoff Implementierung (1s, 2s, 4s, 8s, 16s)
+    last_error = "Keine Antwort erhalten."
     for delay in [1, 2, 4, 8, 16]:
         try:
             response = requests.post(url, json=payload, timeout=60)
@@ -65,15 +62,14 @@ def call_gemini_vision(base64_image, analysis_type):
             elif response.status_code == 429:
                 time.sleep(delay)
                 continue
-            elif response.status_code == 403:
-                return f"Fehler 403: Zugriff verweigert. Der API-Schlüssel ist ungültig oder wurde nicht korrekt injiziert. (Details: {response.text})"
             else:
-                return f"Fehler {response.status_code}: {response.text}"
+                last_error = f"Status {response.status_code}: {response.text}"
+                time.sleep(delay)
         except Exception as e:
-            time.sleep(delay)
             last_error = str(e)
+            time.sleep(delay)
     
-    return f"Verbindungsfehler: {last_error}"
+    return f"KI-Analyse fehlgeschlagen nach mehreren Versuchen. Fehlerdetails: {last_error}"
 
 # --- HILFSFUNKTIONEN ---
 
