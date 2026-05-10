@@ -3,7 +3,6 @@ numpy
 pandas
 matplotlib
 plotly
-datashader
-rasterio
-cupy-cuda12x
 scipy
+datashader
+pyproj
