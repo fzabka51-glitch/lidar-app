@@ -34,9 +34,17 @@ def convert_coords(x, y, from_epsg=2056):
 
 def rasterize_points(df, res):
     """Blitzschnelle Rasterisierung von Millionen Punkten mittels Datashader."""
+    # Berechne Abmessungen des Rasters
+    plot_width = int((df.x.max() - df.x.min()) / res)
+    plot_height = int((df.y.max() - df.y.min()) / res)
+    
+    # Schutz vor leeren/ungültigen Dimensionen
+    plot_width = max(2, plot_width)
+    plot_height = max(2, plot_height)
+    
     cvs = ds.Canvas(
-        plot_width=int((df.x.max() - df.x.min()) / res),
-        plot_height=int((df.y.max() - df.y.min()) / res),
+        plot_width=plot_width,
+        plot_height=plot_height,
         x_range=(df.x.min(), df.x.max()),
         y_range=(df.y.min(), df.y.max())
     )
@@ -98,7 +106,6 @@ with st.sidebar:
     
     st.divider()
     st.subheader("Geo-Referenz")
-    # Standardmäßig auf das moderne Schweizer System LV95 (EPSG: 2056) gesetzt
     epsg_code = st.number_input(
         "EPSG Code (z.B. Schweiz LV95: 2056, Schweiz LV03: 21781, UTM 32N: 25832)", 
         value=2056
@@ -120,56 +127,107 @@ with st.sidebar:
 # --- HAUPTBEREICH ---
 if uploaded_file:
     try:
-        # 1. Daten robust laden
-        with st.spinner("Lese Datei ein..."):
-            try:
-                # Versuche zuerst, Dateien mit flexiblem Whitespace (Leerzeichen/Tabs) zu laden.
-                # comment='#' ignoriert Zeilen, die mit einem Raute-Zeichen beginnen.
+        # 1. Daten robust und speicherschonend laden
+        with st.spinner("Analysiere Dateistruktur und lade Daten..."):
+            # Schnelle Formaterkennung vorab
+            sample_bytes = uploaded_file.read(4096)
+            uploaded_file.seek(0)
+            sample_str = sample_bytes.decode('utf-8', errors='ignore')
+            
+            if ';' in sample_str:
+                detected_sep = ';'
+            elif ',' in sample_str:
+                detected_sep = ','
+            else:
+                detected_sep = r'\s+'  # Standard: Leerzeichen/Tabs
+            
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            estimated_rows = uploaded_file.size / 35  # Grobe Schätzung: ca. 35 Bytes pro Zeile
+            target_rows = 1500000  # Maximal empfohlene Punktmenge für flüssiges Arbeiten
+            
+            # Strategie bei großen Dateien (> 30 MB oder geschätzt > 1.5 Mio Zeilen)
+            if file_size_mb > 30.0 or estimated_rows > target_rows:
+                st.info(f"⚡ Große Datei erkannt ({file_size_mb:.1f} MB). Lese und dezimiere Daten intelligent im Hintergrund...")
+                
+                sample_fraction = target_rows / estimated_rows
+                sample_fraction = max(0.01, min(0.9, sample_fraction))  # Begrenze auf sinnvolle Werte
+                
+                chunks = []
+                chunksize = 250000
+                progress_bar = st.progress(0.0)
+                
+                # Chunked Reading, um RAM-Peaks zu vermeiden
+                reader = pd.read_csv(
+                    uploaded_file, 
+                    sep=detected_sep, 
+                    engine='python' if detected_sep == r'\s+' else 'c', 
+                    header=None,
+                    comment='#',
+                    chunksize=chunksize
+                )
+                
+                for i, chunk in enumerate(reader):
+                    if chunk.shape[1] < 3:
+                        continue
+                    chunk = chunk.iloc[:, :3]
+                    chunk.columns = ['x', 'y', 'z']
+                    
+                    # Schnelle numerische Bereinigung pro Chunk
+                    for col in ['x', 'y', 'z']:
+                        if chunk[col].dtype == object:
+                            chunk[col] = chunk[col].astype(str).str.replace(',', '.', regex=False)
+                        chunk[col] = pd.to_numeric(chunk[col], errors='coerce')
+                    
+                    chunk = chunk.dropna()
+                    
+                    if len(chunk) > 0:
+                        # Direkt im RAM runterskalieren, bevor wir den nächsten Chunk holen
+                        sampled_chunk = chunk.sample(frac=sample_fraction, random_state=42)
+                        chunks.append(sampled_chunk)
+                    
+                    # Update Fortschrittsbalken (gedeckelt bei max 95%)
+                    progress_bar.progress(min(0.95, (i + 1) * 0.1))
+                
+                df = pd.concat(chunks, ignore_index=True)
+                progress_bar.progress(1.0)
+                st.success(f"✅ Datei eingelesen. Datensatz erfolgreich auf {len(df):,} repräsentative Punkte skaliert!")
+            
+            else:
+                # Standard-Ladevorgang bei kleinen Dateien
                 df = pd.read_csv(
                     uploaded_file, 
-                    sep=r'\s+', 
-                    engine='python', 
+                    sep=detected_sep, 
+                    engine='python' if detected_sep == r'\s+' else 'c', 
                     header=None,
                     comment='#'
                 )
-            except Exception:
-                # Fallback für Komma- oder Semikolon-getrennte CSV-Formate
-                uploaded_file.seek(0)
-                df = pd.read_csv(
-                    uploaded_file, 
-                    sep=None, 
-                    engine='python', 
-                    header=None,
-                    comment='#'
-                )
-
-            # Überprüfung, ob überhaupt Spalten gefunden wurden
-            if df.shape[1] < 3:
-                st.error("Die Datei enthält weniger als 3 Spalten. Bitte überprüfe das Dateiformat.")
-                st.stop()
-
-            # Wir behalten nur die ersten 3 Spalten (X, Y, Z) und verwerfen etwaige Zusatzspalten
-            df = df.iloc[:, :3]
-            df.columns = ['x', 'y', 'z']
-
-            # Bereinigung: Konvertiere Spalten sicher zu Zahlen.
-            # Text-Header (z.B. "E N H") oder ungültige Zeilen werden dabei zu NaN.
-            for col in ['x', 'y', 'z']:
-                # Falls in Schweizer Daten Kommas statt Punkte vorkommen (z.B. "2600000,45")
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            # Entferne alle Zeilen, die NaNs enthalten (Header-Zeilen oder fehlerhafte Zeilen)
-            df = df.dropna(subset=['x', 'y', 'z'])
-
-            # Konvertierung in den speicherschonenden Datentyp float32
-            df = df.astype({'x': np.float32, 'y': np.float32, 'z': np.float32})
-
-        # Punkt-Limit-Check
-        if len(df) > 2000000:
-            df = df.sample(2000000, random_state=42)
-            st.warning("⚠️ Datensatz auf 2 Mio. Punkte reduziert.")
+                
+                if df.shape[1] < 3:
+                    st.error("Die Datei enthält weniger als 3 Spalten. Bitte überprüfe das Dateiformat.")
+                    st.stop()
+                
+                df = df.iloc[:, :3]
+                df.columns = ['x', 'y', 'z']
+                
+                for col in ['x', 'y', 'z']:
+                    if df[col].dtype == object:
+                        df[col] = df[col].astype(str).str.replace(',', '.', regex=False)
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                df = df.dropna(subset=['x', 'y', 'z'])
+                df = df.astype({'x': np.float32, 'y': np.float32, 'z': np.float32})
+            
+            # --- AUSREISSER-KOORDINATEN FILTER (Wichtig für Datashader) ---
+            # Falls falsche Koordinaten (z.B. 0 oder gigantische Werte) eingestreut sind
+            if len(df) > 10:
+                q1_x, q3_x = df['x'].quantile(0.25), df['x'].quantile(0.75)
+                iqr_x = q3_x - q1_x
+                # Spatiale Grenzen (erlaubt maximale Streuung von 5 * IQR um den Median)
+                df = df[(df['x'] >= q1_x - 5 * iqr_x) & (df['x'] <= q3_x + 5 * iqr_x)]
+                
+                q1_y, q3_y = df['y'].quantile(0.25), df['y'].quantile(0.75)
+                iqr_y = q3_y - q1_y
+                df = df[(df['y'] >= q1_y - 5 * iqr_y) & (df['y'] <= q3_y + 5 * iqr_y)]
 
         # Grenzen für Rückrechnung von Indizes auf Koordinaten
         min_x, max_x = df.x.min(), df.x.max()
@@ -187,15 +245,37 @@ if uploaded_file:
 
         # 2. Berechnungen
         with st.spinner("Analysiere Gelände..."):
-            gz = rasterize_points(df, grid_res)
-            # Reinigung
-            gz = np.nan_to_num(gz, nan=np.nanmean(gz))
+            # --- CANVAS DIMENSION SCHUTZ ---
+            # Ermittle wie groß das Raster werden würde
+            width_px = int((max_x - min_x) / grid_res)
+            height_px = int((max_y - min_y) / grid_res)
+            max_pixels = 3000  # Maximal zulässige Breite/Höhe des Arrays im RAM
+            
+            grid_res_safe = grid_res
+            if width_px > max_pixels or height_px > max_pixels:
+                max_dim = max(width_px, height_px)
+                scale_factor = max_dim / max_pixels
+                grid_res_safe = grid_res * scale_factor
+                st.warning(
+                    f"⚠️ Die Geländefläche ist zu groß für eine Auflösung von {grid_res}m. "
+                    f"Um einen RAM-Absturz zu verhindern, wurde die Auflösung automatisch "
+                    f"auf **{grid_res_safe:.2f}m** korrigiert."
+                )
+            
+            # Rasterisierung mit der sicheren Auflösung
+            gz = rasterize_points(df, grid_res_safe)
+            
+            # Robustes Handling für ungültige Daten (z. B. wenn Raster nur NaNs enthält)
+            if np.isnan(gz).all():
+                gz = np.zeros_like(gz)
+            else:
+                gz = np.nan_to_num(gz, nan=np.nanmean(gz))
             
             # Alle Modelle berechnen
-            nw_h = calculate_hillshade(gz, 315, 45, grid_res)
-            mds = calculate_multi_hillshade(gz, grid_res)
+            nw_h = calculate_hillshade(gz, 315, 45, grid_res_safe)
+            mds = calculate_multi_hillshade(gz, grid_res_safe)
             lrm = calculate_lrm(gz, lrm_sigma)
-            slope = calculate_slope(gz, grid_res)
+            slope = calculate_slope(gz, grid_res_safe)
             curv = calculate_curvature(gz)
             # Fusion
             comp = np.clip(mds + (lrm - 0.5) * 0.3, 0, 1)
@@ -218,7 +298,6 @@ if uploaded_file:
                 for i, (name, (data, cmap, _)) in enumerate(analysis_models.items()):
                     with [c1, c2][i % 2]:
                         fig, ax = plt.subplots()
-                        # origin='lower' korrigiert die spiegelverkehrte Y-Achse
                         ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                         ax.set_title(name)
                         ax.axis('off')
@@ -228,7 +307,6 @@ if uploaded_file:
                 sel_2d = st.selectbox("Modell wählen:", list(analysis_models.keys()))
                 data, cmap, _ = analysis_models[sel_2d]
                 fig, ax = plt.subplots(figsize=(10, 6))
-                # origin='lower' korrigiert die spiegelverkehrte Y-Achse
                 ax.imshow(data, cmap=cmap, interpolation='none', origin='lower')
                 ax.axis('off')
                 st.pyplot(fig)
