@@ -1,16 +1,16 @@
 """
 LiDAR Archäologie Pro – Entry Point.
 
-Diese Datei ist bewusst dünn: sie verdrahtet nur UI <-> IO <-> Analyse.
-Die eigentliche Logik lebt in einzelnen Dateien wie analysis.py, io_utils.py usw.
+Diese Datei verbindet UI <-> IO <-> Analyse.
+Alle Logikmodule liegen im Paketordner lidar_app/.
 """
 
 import logging
 import streamlit as st
 
-from analysis import run_analysis
-from io_utils import PointCloudLoadError, convert_coords, load_point_cloud
-from ui import render_2d_tab, render_3d_tab, render_location_info, render_sidebar
+from lidar_app.analysis import run_analysis
+from lidar_app.io_utils import PointCloudLoadError, convert_coords, load_point_cloud
+from lidar_app.ui import render_2d_tab, render_3d_tab, render_location_info, render_sidebar
 
 logging.basicConfig(level=logging.INFO)
 
