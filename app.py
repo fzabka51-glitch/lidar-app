@@ -1,5 +1,5 @@
 ""
-LiDAR Archäologie Pro – Entry Point.
+LiDAR Archäologie Pro Entry Point.
 
 Diese Datei ist bewusst dünn: sie verdrahtet nur UI <-> IO <-> Analyse.
 Die eigentliche Logik lebt in lidar_app/*.py und ist damit unabhängig
