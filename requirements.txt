@@ -1,8 +1,10 @@
-streamlit
-numpy
-pandas
-matplotlib
-plotly
-scipy
-datashader
-pyproj
+streamlit>=1.32
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+plotly>=5.18
+scipy>=1.11
+datashader>=0.16
+pyproj>=3.6          # optional, für Lat/Lon-Anzeige
+laspy>=2.5            # optional, für .las/.laz Support
+# cupy-cuda12x>=13.0   # optional, nur falls NVIDIA-GPU vorhanden (auskommentieren & anpassen)
