@@ -1,12 +1,12 @@
-""
-LiDAR Archäologie Pro Entry Point.
+"""
+LiDAR Archäologie Pro – Entry Point.
 
 Diese Datei ist bewusst dünn: sie verdrahtet nur UI <-> IO <-> Analyse.
 Die eigentliche Logik lebt in lidar_app/*.py und ist damit unabhängig
 von Streamlit testbar (z.B. mit pytest auf raster.py / terrain_models.py).
 """
-import logging
 
+import logging
 import streamlit as st
 
 from lidar_app.analysis import run_analysis
@@ -55,7 +55,7 @@ try:
 
 except PointCloudLoadError as exc:
     st.error(f"Datenfehler: {exc}")
-except Exception as exc:  # letzte Sicherheitsnetz-Ebene, mit Logging statt stillem Verschlucken
+except Exception as exc:
     logging.exception("Unerwarteter Fehler in der App-Pipeline")
     st.error(f"Unerwarteter Fehler: {exc}")
     st.caption("Details wurden geloggt. Bitte Datei/Parameter prüfen oder Issue melden.")
