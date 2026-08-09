@@ -227,7 +227,7 @@ if uploaded_file:
             aspect = arch.calculate_aspect(gz, grid_res_effective)
             dtm_approx = arch.estimate_dtm(gz)
             analysis_models["Hangausrichtung (Aspect)"] = (aspect, "twilight", True)
-            analysis_models["DTM (approximiert)"] = (dtm_approx, "terrain", False)
+            analysis_models["DTM (approximiert)"] = (dtm_approx, "earth", False)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "🖼️ 2D-Analyse", "🌐 3D-Prospektion", "🔍 Feature-Erkennung", "📦 GIS-Export"
