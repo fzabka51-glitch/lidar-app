@@ -165,6 +165,15 @@ if uploaded_file:
         if is_raster_input:
             # --- NEUER PFAD: direktes Raster (GeoTIFF/ASC) laden ---
             raster = importers.load_raster(buffer, filename)
+            if raster.get("downsampled"):
+                orig_h, orig_w = raster["original_shape"]
+                st.warning(
+                    f"⚠️ Große Rasterdatei erkannt ({orig_h}x{orig_w} Pixel, z. B. DGM25/DGM1 "
+                    f"über größere Fläche). Automatisch auf {raster['array'].shape[0]}x"
+                    f"{raster['array'].shape[1]} Pixel reduziert, um einen Speicherabsturz zu "
+                    f"vermeiden. Für volle Auflösung bitte einen kleineren Kachel-Ausschnitt "
+                    f"im Geoportal wählen."
+                )
             gz = np.nan_to_num(raster["array"], nan=np.nanmean(raster["array"]))
             grid_res_effective = raster["res"] if raster["res"] else grid_res
             min_x, min_y, max_x, max_y = raster["bounds"]
