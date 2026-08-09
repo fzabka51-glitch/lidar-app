@@ -4,6 +4,14 @@ pandas
 matplotlib
 plotly
 datashader
-rasterio
-cupy-cuda12x
 scipy
+pyproj
+rasterio>=1.3.9
+laspy[lazrs]>=2.5.0
+plyfile>=1.0.3
+rioxarray>=0.15.0
+geopandas>=0.14.3
+shapely>=2.0.3
+scikit-image>=0.22.0
+affine>=2.4.0
+# cupy-cuda12x  # nur aktivieren, wenn eine CUDA-GPU im Deployment verfügbar ist
