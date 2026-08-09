@@ -23,6 +23,23 @@ except ImportError:
 st.set_page_config(page_title="LiDAR Archäologie Pro", layout="wide")
 st.title("🏛️ LiDAR Analyse & High-Performance 3D")
 
+# --- NEU: Colormap-Übersetzung Matplotlib -> Plotly ---
+# Die analysis_models verwenden Matplotlib-Namen (für den 2D-Tab), die 3D-Surface
+# (Plotly) hat aber eine eigene, teils abweichende Namensliste. Diese Tabelle
+# übersetzt bei Bedarf, ohne die Matplotlib-Namen im Dict selbst zu ändern.
+MPL_TO_PLOTLY_CMAP = {
+    "terrain": "earth",
+    "twilight": "phase",
+    "RdBu": "RdBu",
+    "RdYlGn": "RdYlGn",
+    "plasma": "plasma",
+    "gray": "gray",
+}
+
+def to_plotly_colorscale(mpl_cmap_name):
+    """Übersetzt einen Matplotlib-Colormap-Namen in eine gültige Plotly-Colorscale."""
+    return MPL_TO_PLOTLY_CMAP.get(mpl_cmap_name, mpl_cmap_name)
+
 # --- KOORDINATEN-FUNKTION ---
 def convert_coords(x, y, from_epsg=25832):
     """Wandelt metrische Koordinaten in Lat/Lon um."""
@@ -227,7 +244,7 @@ if uploaded_file:
             aspect = arch.calculate_aspect(gz, grid_res_effective)
             dtm_approx = arch.estimate_dtm(gz)
             analysis_models["Hangausrichtung (Aspect)"] = (aspect, "twilight", True)
-            analysis_models["DTM (approximiert)"] = (dtm_approx, "earth", False)
+            analysis_models["DTM (approximiert)"] = (dtm_approx, "terrain", False)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "🖼️ 2D-Analyse", "🌐 3D-Prospektion", "🔍 Feature-Erkennung", "📦 GIS-Export"
@@ -282,7 +299,7 @@ if uploaded_file:
                 y=y_vals,
                 z=z_plot,
                 surfacecolor=surface_tex,
-                colorscale=tex_cmap,
+                colorscale=to_plotly_colorscale(tex_cmap),
                 showscale=show_scale,
                 lighting=dict(ambient=0.6, diffuse=0.8, fresnel=0.2, specular=0.1, roughness=0.5),
                 lightposition=dict(x=100, y=100, z=1000),
