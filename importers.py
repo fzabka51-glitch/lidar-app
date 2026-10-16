@@ -1,18 +1,23 @@
+
+
 """
 importers.py
 ============
 Zentrales Modul für den Datenimport der LiDAR Archäologie Pro App.
 
 Unterstützt neben dem ursprünglichen .xyz/.txt-Format zusätzlich:
-    - .las / .laz  (via laspy)
+    - .las / .laz  (via laspy, inkl. IGN LiDAR HD .copc.laz)
     - .ply         (via plyfile)
     - .csv         (generisches x,y,z)
     - .asc         (ESRI ASCII Grid)
     - .tif / .tiff / .geotiff (via rasterio)
 
-Alle Punktwolken-Loader liefern ein pandas.DataFrame mit den Spalten
-['x', 'y', 'z'] (float32) zurück, optional ergänzt um 'classification'
-und 'intensity', falls in der Quelldatei vorhanden.
+Punktwolken-Loader liefern ein pandas.DataFrame mit den Spalten
+['x', 'y', 'z'].
+    - .xyz/.txt/.csv/.ply: float32 (wie bisher)
+    - .las/.laz: x/y als float64 (wichtig bei Lambert-93, sonst Rundungsfehler),
+      z als float32. Die Punkte sind bereits zu Zellmittelwerten aggregiert.
+      Das erkannte EPSG steht in df.attrs["epsg"] (oder None).
 
 Raster-Loader liefern ein Dictionary mit:
     {
@@ -22,10 +27,6 @@ Raster-Loader liefern ein Dictionary mit:
         "res": float,          # mittlere Pixelauflösung in m
         "bounds": (minx, miny, maxx, maxy)
     }
-
-Design-Prinzip: Diese Datei ist rein additiv und verändert keine
-bestehende Logik in app.py. Der bisherige .xyz-Workflow bleibt davon
-unberührt - `load_xyz_txt` bildet exakt das ursprüngliche Verhalten ab.
 """
 
 from __future__ import annotations
@@ -59,7 +60,9 @@ except ImportError:
     RASTERIO_AVAILABLE = False
 
 
-MAX_POINTS = 2_000_000  # konsistent mit dem bisherigen Limit in app.py
+MAX_POINTS = 2_000_000       # Limit für xyz/txt/csv/ply (wie bisher)
+MAX_CELLS = 20_000_000       # Obergrenze Zellen bei LAS/LAZ (ca. 240 MB RAM)
+GROUND_CLASS = 2             # ASPRS-Klasse "Ground"
 
 
 # --- Punktwolken-Loader --------------------------------------------------
@@ -81,69 +84,121 @@ def load_xyz_txt(file: Union[str, BinaryIO], max_points: int = MAX_POINTS) -> pd
     return df
 
 
-def load_las_laz(file: Union[str, BinaryIO], max_points: int = MAX_POINTS,
-                  chunk_size: int = 5_000_000) -> pd.DataFrame:
-    """Lädt eine .las oder .laz Datei mittels laspy (chunked / speicherschonend).
+def _extract_epsg(header) -> Optional[int]:
+    """Liest den horizontalen EPSG-Code aus dem LAS/LAZ-Header (oder None)."""
+    try:
+        crs = header.parse_crs()          # braucht pyproj
+    except Exception:
+        return None
+    if crs is None:
+        return None
+    try:
+        # IGN: Compound-CRS (Lambert-93 + IGN69) -> horizontalen Teil nehmen
+        if crs.is_compound and crs.sub_crs_list:
+            crs = crs.sub_crs_list[0]
+        epsg = crs.to_epsg()
+        return int(epsg) if epsg else None
+    except Exception:
+        return None
 
-    Für sehr große Dateien wird per Chunked-Reader gelesen und bei Bedarf
-    zufällig auf `max_points` heruntergesampelt, damit der Speicher der
-    Streamlit-App nicht überläuft.
+
+def load_las_laz(file: Union[str, BinaryIO], max_points: int = MAX_POINTS,
+                  chunk_size: int = 2_000_000, ground_only: bool = True,
+                  cell_size: float = 0.5) -> pd.DataFrame:
+    """Lädt .las/.laz/.copc.laz blockweise, speicherschonend.
+
+    Jeder Block wird direkt in ein Zellraster aggregiert (Mittelwert pro Zelle),
+    es liegt also nie die komplette Punktwolke im RAM. Koordinaten bleiben
+    float64, damit Lambert-93 (Y ~ 6.8 Mio. m) nicht gerundet wird.
 
     Args:
         file: Pfad oder file-like Objekt einer .las/.laz Datei.
-        max_points: Obergrenze für die Anzahl geladener Punkte.
-        chunk_size: Anzahl Punkte pro Lese-Chunk (Streaming).
+        max_points: Nur für Signatur-Kompatibilität, bei LAS/LAZ ersetzt die
+            Zell-Aggregation das Zufalls-Sampling.
+        chunk_size: Anzahl Punkte pro Lese-Chunk.
+        ground_only: nur Klasse 2 (Boden) verwenden.
+        cell_size: Zellgrösse der Aggregation in Metern.
 
     Returns:
-        DataFrame mit Spalten x, y, z sowie optional classification, intensity.
-
-    Raises:
-        ImportError: falls laspy nicht installiert ist.
+        DataFrame x, y, z (Zellmittelwerte). df.attrs["epsg"] enthält das
+        erkannte EPSG oder None.
     """
     if not LASPY_AVAILABLE:
         raise ImportError("Das Paket 'laspy' wird für .las/.laz Dateien benötigt "
-                           "(pip install laspy[lazrs]).")
+                           "(pip install 'laspy[lazrs]').")
 
-    xs, ys, zs, classes, intens = [], [], [], [], []
-    total = 0
+    n_seen = 0
+    n_used = 0
 
-    with laspy.open(file) as reader:
-        header_count = reader.header.point_count
-        # Reservoir-artiges Downsampling beim Streamen großer Dateien
-        keep_ratio = min(1.0, max_points / max(header_count, 1))
+    try:
+        with laspy.open(file) as reader:
+            hdr = reader.header
+            x0, y0 = float(hdr.mins[0]), float(hdr.mins[1])
+            x1, y1 = float(hdr.maxs[0]), float(hdr.maxs[1])
 
-        for points in reader.chunk_iterator(chunk_size):
-            n = len(points.x)
-            if keep_ratio < 1.0:
-                mask = np.random.rand(n) < keep_ratio
-            else:
-                mask = np.ones(n, dtype=bool)
+            nx = int(np.ceil((x1 - x0) / cell_size)) + 1
+            ny = int(np.ceil((y1 - y0) / cell_size)) + 1
+            if nx * ny > MAX_CELLS:
+                raise ValueError(
+                    f"Raster zu gross ({nx}x{ny} Zellen). Bitte in der Sidebar eine "
+                    f"gröbere Auflösung wählen oder die Datei vorher zuschneiden."
+                )
 
-            xs.append(np.asarray(points.x)[mask])
-            ys.append(np.asarray(points.y)[mask])
-            zs.append(np.asarray(points.z)[mask])
+            sum_z = np.zeros(nx * ny, dtype=np.float64)
+            cnt = np.zeros(nx * ny, dtype=np.int32)
 
-            if hasattr(points, "classification"):
-                classes.append(np.asarray(points.classification)[mask])
-            if hasattr(points, "intensity"):
-                intens.append(np.asarray(points.intensity)[mask])
+            for pts in reader.chunk_iterator(chunk_size):
+                n_seen += len(pts)
+                mask = np.ones(len(pts), dtype=bool)
+                if ground_only:
+                    mask &= (np.asarray(pts.classification) == GROUND_CLASS)
+                if not mask.any():
+                    continue
 
-            total += mask.sum()
+                x = np.asarray(pts.x)[mask]
+                y = np.asarray(pts.y)[mask]
+                z = np.asarray(pts.z)[mask]
 
+                ix = np.clip(((x - x0) / cell_size).astype(np.int64), 0, nx - 1)
+                iy = np.clip(((y - y0) / cell_size).astype(np.int64), 0, ny - 1)
+                idx = iy * nx + ix
+
+                # Speicher proportional zum Chunk, nicht zur Rastergrösse
+                uniq, inv = np.unique(idx, return_inverse=True)
+                inv = inv.ravel()
+                sum_z[uniq] += np.bincount(inv, weights=z, minlength=len(uniq))
+                cnt[uniq] += np.bincount(inv, minlength=len(uniq)).astype(np.int32)
+                n_used += len(z)
+
+            epsg = _extract_epsg(hdr)
+
+    except ValueError:
+        raise
+    except Exception as e:
+        if "backend" in str(e).lower():
+            raise RuntimeError(
+                "Kein LAZ-Backend gefunden. Bitte 'laspy[lazrs]>=2.4' in die "
+                "requirements.txt eintragen und die App neu starten."
+            ) from e
+        raise
+
+    if n_used == 0:
+        if ground_only and n_seen > 0:
+            raise ValueError(
+                f"Keine Bodenpunkte (Klasse {GROUND_CLASS}) gefunden ({n_seen:,} Punkte "
+                f"gelesen). Ist die Datei unklassifiziert? Dann in der Sidebar "
+                f"'Nur Bodenpunkte' ausschalten."
+            )
+        raise ValueError("Die Datei enthält keine Punkte.")
+
+    cells = np.nonzero(cnt)[0]
     df = pd.DataFrame({
-        "x": np.concatenate(xs).astype(np.float32),
-        "y": np.concatenate(ys).astype(np.float32),
-        "z": np.concatenate(zs).astype(np.float32),
+        "x": x0 + (cells % nx + 0.5) * cell_size,
+        "y": y0 + (cells // nx + 0.5) * cell_size,
+        "z": (sum_z[cells] / cnt[cells]).astype(np.float32),
     })
-    if classes:
-        df["classification"] = np.concatenate(classes)
-    if intens:
-        df["intensity"] = np.concatenate(intens)
-
-    if len(df) > max_points:
-        df = df.sample(max_points, random_state=42)
-
-    return df.reset_index(drop=True)
+    df.attrs["epsg"] = epsg
+    return df
 
 
 def load_ply(file: Union[str, BinaryIO], max_points: int = MAX_POINTS) -> pd.DataFrame:
@@ -224,27 +279,14 @@ def load_asc(file: Union[str, BinaryIO]) -> dict:
     }
 
 
-MAX_RASTER_PIXELS = 16_000_000  # ca. 4000x4000 - schützt vor Speicherabsturz bei großen DGM-Kacheln
-
-
-def load_geotiff(file: Union[str, BinaryIO], max_pixels: int = MAX_RASTER_PIXELS) -> dict:
+def load_geotiff(file: Union[str, BinaryIO]) -> dict:
     """Lädt ein GeoTIFF / TIF Höhenraster via rasterio.
-
-    Sehr große Kacheln (z. B. DGM25/DGM1-Exporte mit 25 cm - 1 m Auflösung
-    über eine größere Fläche) werden automatisch per Decimated Read
-    (Resampling während des Einlesens, nicht danach) auf `max_pixels`
-    heruntergerechnet. Das verhindert, dass das komplette hochauflösende
-    Array unnötig in den Arbeitsspeicher geladen wird und die App
-    (insbesondere in speicherbegrenzten Cloud-Umgebungen) abstürzt.
 
     Args:
         file: Pfad oder file-like Objekt einer .tif/.tiff Datei.
-        max_pixels: Obergrenze für Breite*Höhe des geladenen Arrays.
-            Bei Überschreitung wird automatisch downgesampelt.
 
     Returns:
-        Dict mit array, transform, crs, res, bounds. Enthält zusätzlich
-        "downsampled": bool und bei Downsampling "original_shape".
+        Dict mit array, transform, crs, res, bounds.
 
     Raises:
         ImportError: falls rasterio nicht installiert ist.
@@ -260,45 +302,22 @@ def load_geotiff(file: Union[str, BinaryIO], max_pixels: int = MAX_RASTER_PIXELS
         src_ctx = rasterio.open(file)
 
     with src_ctx as src:
-        orig_height, orig_width = src.height, src.width
-        orig_pixels = orig_height * orig_width
-        downsampled = orig_pixels > max_pixels
-
-        if downsampled:
-            scale = (max_pixels / orig_pixels) ** 0.5
-            out_height = max(1, int(orig_height * scale))
-            out_width = max(1, int(orig_width * scale))
-            array = src.read(
-                1,
-                out_shape=(out_height, out_width),
-                resampling=rasterio.enums.Resampling.average,
-            ).astype(np.float32)
-            # Transform an die neue (gröbere) Auflösung anpassen
-            transform = src.transform * src.transform.scale(
-                (orig_width / out_width), (orig_height / out_height)
-            )
-        else:
-            array = src.read(1).astype(np.float32)
-            transform = src.transform
-
+        array = src.read(1).astype(np.float32)
         nodata = src.nodata
         if nodata is not None:
             array = np.where(array == nodata, np.nan, array)
+        transform = src.transform
         crs = src.crs
         res = abs(transform.a)
         bounds = src.bounds
 
-    result = {
+    return {
         "array": array,
         "transform": transform,
         "crs": crs,
         "res": res,
         "bounds": (bounds.left, bounds.bottom, bounds.right, bounds.top),
-        "downsampled": downsampled,
     }
-    if downsampled:
-        result["original_shape"] = (orig_height, orig_width)
-    return result
 
 
 # --- Dispatcher ------------------------------------------------------------
@@ -313,14 +332,18 @@ def get_extension(filename: str) -> str:
 
 
 def load_point_cloud(file: Union[str, BinaryIO], filename: str,
-                      max_points: int = MAX_POINTS) -> pd.DataFrame:
+                      max_points: int = MAX_POINTS,
+                      ground_only: bool = True,
+                      cell_size: float = 0.5) -> pd.DataFrame:
     """Dispatcher: lädt eine Punktwolken-Datei anhand ihrer Endung.
 
     Args:
         file: Pfad oder file-like Objekt.
         filename: Originaldateiname (für die Endungserkennung, z. B. von
             st.file_uploader.name).
-        max_points: Obergrenze für die Anzahl geladener Punkte.
+        max_points: Obergrenze für die Anzahl geladener Punkte (xyz/ply).
+        ground_only: nur für LAS/LAZ: nur Bodenpunkte (Klasse 2) verwenden.
+        cell_size: nur für LAS/LAZ: Zellgrösse der Aggregation in Metern.
 
     Returns:
         DataFrame mit mindestens den Spalten x, y, z.
@@ -332,7 +355,8 @@ def load_point_cloud(file: Union[str, BinaryIO], filename: str,
     if ext in (".xyz", ".txt", ".csv"):
         return load_xyz_txt(file, max_points)
     elif ext == ".las" or ext == ".laz":
-        return load_las_laz(file, max_points)
+        return load_las_laz(file, max_points, ground_only=ground_only,
+                             cell_size=cell_size)
     elif ext == ".ply":
         return load_ply(file, max_points)
     else:
