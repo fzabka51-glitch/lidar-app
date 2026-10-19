@@ -1,9 +1,11 @@
-streamlit
+streamlit>=1.35
 numpy
 pandas
-matplotlib
-plotly
-datashader
-rasterio
-cupy-cuda12x
 scipy
+matplotlib>=3.6
+plotly>=5.18
+laspy[lazrs]>=2.4
+rasterio
+pyproj
+scikit-image
+plyfile
