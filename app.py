@@ -1,6 +1,10 @@
 # =============================================================================
-# app.py – LiDAR Archäologie Pro 2.0 (eine Datei, ersetzt importers/archaeology/exporters)
+# app.py – LiDAR Archäologie Pro 2.2 (eine Datei, ersetzt importers/archaeology/exporters)
 # Konvention: Raster intern "Nord oben" (Zeile 0 = Norden), alle Parameter in Metern.
+# Neu in 2.1: größere Galerie, Einzelbild-Ansicht, Mausrad-Zoom, scharfe interaktive
+#             Ansicht, einstellbare Bildhöhe und Bildauflösung.
+# Neu in 2.2: Kontrast-Streckung für alle Modelle, kräftigere 3D-Schattierung mit
+#             Lichtrichtung aus der Sidebar, Regler "Schattierung" im 3D-Tab.
 # =============================================================================
 from __future__ import annotations
 import base64, html, io, json, math, os, re, warnings
@@ -61,7 +65,8 @@ DEFAULTS = dict(
     morph_filter=False, morph_window_m=15.0, morph_threshold_m=1.5,
     hs_azimuth=315, hs_altitude=35, lrm_sigma_m=15.0,
     enable_svf=False, svf_dirs=8, svf_radius_m=15,
-    stretch=(2.0, 98.0), hide_voids=True, z_exag=2.0,
+    stretch=(2.0, 98.0), hide_voids=True, z_exag=2.0, view_height=850, view_px=2000,
+    shade_3d=0.7,
     det_lines=True, line_min_m=20.0, det_blobs=True, blob_d=(4.0, 30.0), blob_min_h=0.2,
     det_rings=False, ring_d=(10.0, 60.0),
 )
@@ -525,13 +530,14 @@ def compute_models(models_key, _z, res, az, alt, sigma_m, svf_on, svf_dirs, svf_
                  np.clip((pos - 60) / 35, 0, 1)]
     else:
         parts = [hs, 1 - np.clip(slope / 50, 0, 1), lrm_n]
+    # Graustufen-Modelle ohne feste Skala -> werden über den Kontrastregler gestreckt
     L = {
-        "Final Composite (Fusion)": Layer(comp, "gray", fixed=(0, 1), desc="MDS + Restrelief (Ursprungsversion)."),
-        "VAT-ähnliche Fusion": Layer(np.mean(parts, axis=0).astype(np.float32), "gray", fixed=(0, 1),
+        "Final Composite (Fusion)": Layer(comp, "gray", desc="MDS + Restrelief (Ursprungsversion)."),
+        "VAT-ähnliche Fusion": Layer(np.mean(parts, axis=0).astype(np.float32), "gray",
                                      desc="Hillshade + Slope + " + ("SVF + Openness" if svf_on else "LRM")
                                      + " – angelehnt an VAT (Kokalj & Somrak)."),
-        "Hillshade": Layer(hs, "gray", fixed=(0, 1), desc=f"Azimut {az}°, Sonnenhöhe {alt}°."),
-        "MDS Composite": Layer(mds, "gray", fixed=(0, 1), desc="Mittel aus 4 Lichtrichtungen."),
+        "Hillshade": Layer(hs, "gray", desc=f"Azimut {az}°, Sonnenhöhe {alt}°."),
+        "MDS Composite": Layer(mds, "gray", desc="Mittel aus 4 Lichtrichtungen."),
         "Restrelief (LRM)": Layer(lrm, "RdBu_r", "m", True, desc=f"Höhe minus Glättung (σ={sigma_m:.0f} m). Rot = erhaben."),
         "Multi-Skalen-Relief": Layer(msrm, "RdBu_r", "m", True, desc="Mittleres Restrelief über 2–40 m."),
         "Hangneigung (Slope)": Layer(slope, "plasma", "°", desc="Neigung in Grad."),
@@ -591,7 +597,24 @@ def png_bytes(rgba):
     return buf.getvalue()
 
 
-@st.cache_resource(max_entries=64)
+PLOTLY_CONFIG = {"scrollZoom": True, "displaylogo": False,
+                 "toImageButtonOptions": {"format": "png", "scale": 2}}
+
+
+def show_plot(fig, container=None):
+    """Plotly-Diagramm in voller Breite, Mausrad-Zoom aktiv."""
+    (container or st).plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+
+def show_image(img, caption=None):
+    """Bild in voller Spaltenbreite (kompatibel mit älteren und neueren Streamlit-Versionen)."""
+    try:
+        st.image(img, caption=caption, use_container_width=True)
+    except TypeError:
+        st.image(img, caption=caption, use_column_width=True)
+
+
+@st.cache_resource(max_entries=32)
 def layer_png(key, _L, _grid, stretch, hide, max_dim):
     arr, _ = display_array(_L, _grid, max_dim, hide)
     return png_bytes(to_rgba(arr, _L.cmap, *vrange(_L, stretch)))
@@ -625,24 +648,48 @@ def feature_traces(feats, grid):
     return traces
 
 
-def layer_figure(name, L, grid, max_dim=900, feats=None, height=720, overlay=None, opacity=0.5):
-    def heat(layer, op=1.0, scale=True):
-        arr, s = display_array(layer, grid, max_dim, S.hide_voids)
-        xs, ys = ds_axes(grid, arr.shape, s)
-        vmin, vmax = vrange(layer, S.stretch)
-        u = f" {layer.unit}" if layer.unit else ""
-        return go.Heatmap(z=arr, x=xs, y=ys, colorscale=plotly_cs(layer.cmap), zmin=vmin, zmax=vmax,
-                          opacity=op, showscale=scale and bool(layer.unit), colorbar=dict(title=layer.unit),
-                          hovertemplate=f"X %{{x:.1f}} · Y %{{y:.1f}}<br>%{{z:.3f}}{u}<extra></extra>")
-    fig = go.Figure(heat(L))
-    if overlay is not None:
-        fig.add_trace(heat(overlay, opacity, scale=False))
+def layer_figure(name, L, grid, max_dim=None, feats=None, height=None, overlay=None, opacity=0.5):
+    """Scharfes, zoombares Bild: PNG als Hintergrund + unsichtbares Raster für Messwerte."""
+    max_dim = int(max_dim or S.view_px)
+    height = int(height or S.view_height)
+    fig = go.Figure()
+
+    # 1) Hochaufgelöste Bilder (Basis + optional Überlagerung) passgenau in Weltkoordinaten
+    extent = dict(xref="x", yref="y", x=grid.x_min, y=grid.y_max,
+                  sizex=grid.x_max - grid.x_min, sizey=grid.y_max - grid.y_min,
+                  sizing="stretch", layer="below")
+    stack = [(L, 1.0)] + ([(overlay, opacity)] if overlay is not None else [])
+    for layer, op in stack:
+        png = layer_png((models_key, id(layer)), layer, grid, tuple(S.stretch), S.hide_voids, max_dim)
+        fig.add_layout_image(source="data:image/png;base64," + base64.b64encode(png).decode(),
+                             opacity=op, **extent)
+
+    # 2) Unsichtbares, grobes Raster nur für die Messwert-Anzeige beim Überfahren
+    hv, s = display_array(L, grid, 400, S.hide_voids)
+    xs, ys = ds_axes(grid, hv.shape, s)
+    u = f" {L.unit}" if L.unit else ""
+    fig.add_trace(go.Heatmap(z=hv, x=xs, y=ys, opacity=0, showscale=False, showlegend=False,
+                             hovertemplate=f"X %{{x:.1f}} · Y %{{y:.1f}}<br>≈ %{{z:.3f}}{u}<extra></extra>"))
+
+    # 3) Farbskala (nur bei Modellen mit Einheit)
+    if L.unit:
+        vmin, vmax = vrange(L, S.stretch)
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+                                 marker=dict(colorscale=plotly_cs(L.cmap), cmin=vmin, cmax=vmax,
+                                             color=[vmin], showscale=True, colorbar=dict(title=L.unit))))
+
+    # 4) Erkannte Features
     for t in feature_traces(feats or [], grid):
         fig.add_trace(t)
-    fig.update_layout(height=height, title=name, margin=dict(l=10, r=10, t=40, b=10),
-                      xaxis=dict(title="X (m)", constrain="domain"),
-                      yaxis=dict(title="Y (m)", scaleanchor="x", scaleratio=1),
-                      legend=dict(orientation="h", y=-0.08))
+
+    fig.update_layout(
+        height=height, title=name, margin=dict(l=10, r=10, t=40, b=10),
+        dragmode="pan", uirevision=str(hash(grid_key)), plot_bgcolor="white",
+        xaxis=dict(title="X (m)", range=[grid.x_min, grid.x_max], constrain="domain",
+                   showgrid=False, zeroline=False),
+        yaxis=dict(title="Y (m)", range=[grid.y_min, grid.y_max], scaleanchor="x", scaleratio=1,
+                   showgrid=False, zeroline=False),
+        legend=dict(orientation="h", y=-0.08))
     return fig
 
 
@@ -697,7 +744,8 @@ def detect_features(lrm, bg_slope, grid, p):
                                        max_sigma=smax, num_sigma=8, threshold=0.1, overlap=0.5):
                 rad, r, c = sb * math.sqrt(2) * f, rb * f, cb * f
                 rr = int(math.ceil(rad))
-                r_lo, r_hi, c_lo, c_hi = max(0, int(r) - rr), min(H, int(r) + rr + 1), max(0, int(c) - rr), min(W, int(c) + rr + 1)
+                r_lo, r_hi = max(0, int(r) - rr), min(H, int(r) + rr + 1)
+                c_lo, c_hi = max(0, int(c) - rr), min(W, int(c) + rr + 1)
                 yy, xx = np.ogrid[r_lo:r_hi, c_lo:c_hi]
                 vals = sign * lrm[r_lo:r_hi, c_lo:c_hi][(yy - r) ** 2 + (xx - c) ** 2 <= rad**2]
                 if vals.size and vals.max() >= p["blob_min_h"]:
@@ -795,7 +843,7 @@ def build_report(names, fdf):
     prow = "".join(f"<tr><th>{k}</th><td>{html.escape(str(S[k]))}</td></tr>" for k in DEFAULTS)
     imgs = "".join(
         f"<div><h3>{html.escape(n)}</h3><img src='data:image/png;base64,"
-        f"{base64.b64encode(layer_png((models_key, n), layers[n], grid, tuple(S.stretch), S.hide_voids, 1000)).decode()}'>"
+        f"{base64.b64encode(layer_png((models_key, n), layers[n], grid, tuple(S.stretch), S.hide_voids, 1200)).decode()}'>"
         f"<p>{html.escape(layers[n].desc)}</p></div>" for n in names)
     ftab = fdf.to_html(index=False, render_links=True) if len(fdf) else "<p>Keine Features erkannt.</p>"
     css = ("body{font-family:Arial,sans-serif;max-width:1100px;margin:auto;padding:20px}"
@@ -846,7 +894,8 @@ with st.sidebar:
     st.slider("Filterschwelle (m)", 0.2, 5.0, step=0.1, key="morph_threshold_m", disabled=not S.morph_filter)
 
     st.subheader("🏔️ Reliefmodelle")
-    st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth")
+    st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth",
+              help="Gilt für Hillshade und für die Lichtrichtung in 3D.")
     st.slider("Sonnenhöhe (°)", 5, 80, key="hs_altitude", help="Flaches Licht (10–25°) betont feine Wälle.")
     st.slider("LRM-Glättung σ (m)", 2.0, 60.0, step=1.0, key="lrm_sigma_m")
     st.checkbox("SVF & Openness berechnen (rechenintensiv)", key="enable_svf")
@@ -854,9 +903,14 @@ with st.sidebar:
     st.slider("Suchradius (m)", 5, 50, key="svf_radius_m", disabled=not S.enable_svf)
 
     st.subheader("🎨 Anzeige")
-    st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch")
+    st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch",
+              help="Enger (z. B. 5–95) = kräftigerer Kontrast. Gilt für 2D, 3D, Karte und Bericht.")
     st.checkbox("Große Datenlücken ausblenden", key="hide_voids")
     st.slider("Z-Überhöhung (3D)", 0.5, 10.0, step=0.5, key="z_exag")
+    st.slider("Bildhöhe (px)", 400, 1600, step=50, key="view_height",
+              help="Höhe der interaktiven Ansicht, der Karte und der 3D-Ansicht.")
+    st.slider("Bildauflösung (px)", 800, 3000, step=100, key="view_px",
+              help="Höher = schärfer beim Hineinzoomen, aber langsamer.")
 
     st.subheader("🔍 Feature-Erkennung")
     st.checkbox("Lineare Strukturen", key="det_lines")
@@ -933,32 +987,42 @@ try:
 
     # ---------------- 2D ----------------
     with t2d:
-        mode = st.radio("Ansicht", ["Galerie", "Interaktiv", "Überblendung"], horizontal=True)
+        mode = st.radio("Ansicht", ["Galerie", "Einzelbild", "Interaktiv", "Überblendung"],
+                        horizontal=True, key="mode2d")
         if mode == "Galerie":
-            cols = st.columns(3)
+            ncol = st.select_slider("Bilder pro Zeile", options=[1, 2, 3], value=2, key="gal_cols")
+            cols = st.columns(ncol)
             for i, n in enumerate(names):
-                with cols[i % 3]:
-                    st.image(layer_png((models_key, n), layers[n], grid, tuple(S.stretch), S.hide_voids, 500),
-                             caption=n)
+                with cols[i % ncol]:
+                    show_image(layer_png((models_key, n), layers[n], grid, tuple(S.stretch),
+                                         S.hide_voids, 1200), caption=n)
+            st.caption("💡 Mit der Maus über ein Bild fahren → oben rechts erscheint das Vollbild-Symbol.")
+        elif mode == "Einzelbild":
+            sel = st.selectbox("Modell", names, key="sel_single")
+            st.caption(layers[sel].desc)
+            show_image(layer_png((models_key, sel), layers[sel], grid, tuple(S.stretch),
+                                 S.hide_voids, int(S.view_px)), caption=sel)
         elif mode == "Interaktiv":
             sel = st.selectbox("Modell", names, key="sel2d")
             show_f = st.checkbox(f"Erkannte Features einblenden ({len(feats)})", value=bool(feats))
-            st.caption(layers[sel].desc)
-            st.plotly_chart(layer_figure(sel, layers[sel], grid, feats=feats if show_f else None),
-                            use_container_width=True)
+            st.caption(f"{layers[sel].desc}  ·  🖱️ Mausrad = Zoom · Ziehen = Verschieben · "
+                       "Doppelklick = Gesamtansicht")
+            show_plot(layer_figure(sel, layers[sel], grid, feats=feats if show_f else None))
         else:
             c1, c2, c3 = st.columns(3)
             a = c1.selectbox("Basis", names, index=names.index("Hillshade"), key="blend_a")
             b = c2.selectbox("Überlagerung", names, index=names.index("Restrelief (LRM)"), key="blend_b")
-            op = c3.slider("Deckkraft", 0.0, 1.0, 0.5, 0.05)
-            st.plotly_chart(layer_figure(f"{a} + {b}", layers[a], grid, overlay=layers[b], opacity=op),
-                            use_container_width=True)
+            op = c3.slider("Deckkraft", 0.0, 1.0, 0.5, 0.05, key="blend_op")
+            st.caption("🖱️ Mausrad = Zoom · Ziehen = Verschieben · Doppelklick = Gesamtansicht")
+            show_plot(layer_figure(f"{a} + {b}", layers[a], grid, overlay=layers[b], opacity=op))
 
     # ---------------- 3D ----------------
     with t3d:
-        c1, c2 = st.columns([2, 1])
+        c1, c2, c3 = st.columns([2, 1, 1])
         tex = c1.selectbox("Textur", names, key="tex3d")
         npts = c2.select_slider("Detailgrad (Punkte)", [100_000, 250_000, 400_000, 600_000], value=250_000)
+        shade = c3.slider("Schattierung", 0.0, 1.0, step=0.05, key="shade_3d",
+                          help="0 = flach (nur Textur) · 1 = sehr plastisch. Lichtrichtung = Sidebar.")
         s = max(1, math.ceil(math.sqrt(grid.w * grid.h / npts)))
         zp, tp = grid.z[::s, ::s].copy(), layers[tex].raw[::s, ::s].astype(np.float32, copy=True)
         if S.hide_voids and grid.void.any():
@@ -967,16 +1031,25 @@ try:
         dx, dy = grid.w * grid.res, grid.h * grid.res
         zr = float(np.nanmax(zp) - np.nanmin(zp)) or 1.0
         vmin, vmax = vrange(layers[tex], S.stretch)
+        # Lichtrichtung aus Sidebar (Azimut/Sonnenhöhe), Stärke aus Regler "Schattierung"
+        az_r, alt_r = math.radians(S.hs_azimuth), math.radians(S.hs_altitude)
+        light_pos = dict(x=1e5 * math.sin(az_r) * math.cos(alt_r),
+                         y=1e5 * math.cos(az_r) * math.cos(alt_r),
+                         z=1e5 * math.sin(alt_r))
+        lighting = dict(ambient=0.9 - 0.6 * shade, diffuse=0.1 + 0.85 * shade,
+                        specular=0.05, roughness=0.9, fresnel=0.05)
         fig3d = go.Figure(go.Surface(
             x=xs, y=ys, z=zp, surfacecolor=tp, colorscale=plotly_cs(layers[tex].cmap), cmin=vmin, cmax=vmax,
-            showscale=bool(layers[tex].unit), lighting=dict(ambient=0.6, diffuse=0.8, specular=0.1, roughness=0.6),
+            showscale=bool(layers[tex].unit), lighting=lighting, lightposition=light_pos,
             hovertemplate="X %{x:.1f} · Y %{y:.1f}<br>Höhe %{z:.2f} m<extra></extra>"))
-        fig3d.update_layout(height=780, margin=dict(l=0, r=0, t=30, b=0), title=f"3D: {tex}",
+        fig3d.update_layout(height=int(S.view_height), margin=dict(l=0, r=0, t=30, b=0), title=f"3D: {tex}",
                             scene=dict(aspectmode="manual",
                                        aspectratio=dict(x=1, y=dy / dx, z=max(zr / dx * S.z_exag, 0.02)),
                                        xaxis_title="X (m)", yaxis_title="Y (m)", zaxis_title="Höhe (m)"))
-        st.plotly_chart(fig3d, use_container_width=True)
-        st.caption(f"Jeder {s}. Pixel dargestellt · Z-Überhöhung {S.z_exag}× (Sidebar).")
+        show_plot(fig3d)
+        st.caption(f"Jeder {s}. Pixel dargestellt · Z-Überhöhung {S.z_exag}× · Kontrast {S.stretch[0]:.0f}–"
+                   f"{S.stretch[1]:.0f} % (Sidebar). 💡 Für mehr Kontrast: Kontrast enger stellen (z. B. 5–95) "
+                   "oder Schattierung erhöhen.")
 
     # ---------------- Karte ----------------
     with tmap:
@@ -994,7 +1067,8 @@ try:
             cy = [grid.y_max, grid.y_max, grid.y_min, grid.y_min]
             clat, clon = to_latlon(np.array(cx), np.array(cy), crs)
             uri = "data:image/png;base64," + base64.b64encode(
-                layer_png((models_key, mlayer), layers[mlayer], grid, tuple(S.stretch), S.hide_voids, 1500)).decode()
+                layer_png((models_key, mlayer), layers[mlayer], grid, tuple(S.stretch),
+                          S.hide_voids, int(S.view_px))).decode()
             mlayers = []
             if base.startswith("Satellit"):
                 mlayers.append(dict(sourcetype="raster", source=[ESRI_URL], below="traces",
@@ -1020,9 +1094,10 @@ try:
             fig_m.update_layout(**{"map" if use_new else "mapbox": dict(
                 style="white-bg" if base != "OpenStreetMap" else "open-street-map",
                 center=dict(lat=latlon[0], lon=latlon[1]), zoom=zoom, layers=mlayers)},
-                height=720, margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h"))
-            st.plotly_chart(fig_m, use_container_width=True)
-            st.caption("Das Overlay wird über seine Eckpunkte eingepasst (für Kacheln bis einige km ausreichend genau).")
+                height=int(S.view_height), margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h"))
+            show_plot(fig_m)
+            st.caption("🖱️ Mausrad = Zoom · Ziehen = Verschieben. Das Overlay wird über seine Eckpunkte "
+                       "eingepasst (für Kacheln bis einige km ausreichend genau).")
 
     # ---------------- Profil ----------------
     with tprof:
@@ -1044,17 +1119,17 @@ try:
             ls = ndimage.map_coordinates(extras["lrm"], [rr, cc], order=1, mode="nearest")
             dist = np.linspace(0, length, n)
             a, b = st.columns([1, 2])
-            ov = layer_figure("Lage", layers["Hillshade"], grid, max_dim=500, height=450)
+            ov = layer_figure("Lage", layers["Hillshade"], grid, max_dim=1000, height=450)
             ov.add_trace(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines+markers", name="Profil",
                                     line=dict(color="red", width=3)))
-            a.plotly_chart(ov, use_container_width=True)
+            show_plot(ov, a)
             pf = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
                                subplot_titles=("Höhe (m)", "Restrelief (m)"))
             pf.add_trace(go.Scatter(x=dist, y=zs, mode="lines", name="Höhe"), row=1, col=1)
             pf.add_trace(go.Scatter(x=dist, y=ls, mode="lines", name="LRM", line=dict(color="firebrick")), row=2, col=1)
             pf.add_hline(y=0, line_dash="dot", row=2, col=1)
             pf.update_layout(height=450, showlegend=False, margin=dict(t=30, b=10), xaxis2_title="Distanz (m)")
-            b.plotly_chart(pf, use_container_width=True)
+            show_plot(pf, b)
             st.download_button("⬇️ Profil als CSV", pd.DataFrame(
                 {"distanz_m": dist, "x": px, "y": py, "hoehe_m": zs, "lrm_m": ls}).to_csv(index=False).encode(),
                 file_name="profil.csv", mime="text/csv")
@@ -1080,8 +1155,7 @@ try:
                 for i, (t, cnt) in enumerate(types.items(), 1):
                     mc[i].metric(t, int(cnt))
                 fbase = st.selectbox("Hintergrund", names, index=names.index("Restrelief (LRM)"), key="feat_base")
-                st.plotly_chart(layer_figure(f"Features auf {fbase}", layers[fbase], grid, feats=feats),
-                                use_container_width=True)
+                show_plot(layer_figure(f"Features auf {fbase}", layers[fbase], grid, feats=feats))
                 st.dataframe(features_df(feats, crs), use_container_width=True, hide_index=True,
                              column_config={"Google Maps": st.column_config.LinkColumn(display_text="Öffnen")})
                 st.caption("🔴 auffällig · 🟠 möglich · 🔵 unklar – regelbasierte Vorauswahl (Größe, Höhe, "
@@ -1128,7 +1202,7 @@ try:
         lazy_download("HTML-Bericht erzeugen", (feat_key, tuple(rep), tuple(S.stretch)),
                       lambda: build_report(rep, features_df(feats, crs)), "lidar_bericht.html", "text/html")
         st.download_button("💾 Projekt speichern (.json)", json.dumps(
-            {"app": "LiDAR Archäologie Pro 2.0", "dateien": [f.name for f in files], "crs": crs,
+            {"app": "LiDAR Archäologie Pro 2.2", "dateien": [f.name for f in files], "crs": crs,
              "parameter": {k: S[k] for k in DEFAULTS}}, ensure_ascii=False, indent=2).encode("utf-8"),
             "lidar_projekt.json", "application/json")
 
@@ -1136,3 +1210,4 @@ except Exception as e:
     st.error(f"Fehler bei der Analyse: {e}")
     with st.expander("Technische Details"):
         st.exception(e)
+
