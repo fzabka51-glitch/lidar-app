@@ -1,11 +1,11 @@
 # =============================================================================
-# app.py – LiDAR Archäologie Pro 2.3 (eine Datei, ersetzt importers/archaeology/exporters)
+# app.py – LiDAR Archäologie Pro 2.4 (eine Datei, ersetzt importers/archaeology/exporters)
 # Konvention: Raster intern "Nord oben" (Zeile 0 = Norden), alle Parameter in Metern.
-# Neu in 2.1: größere Galerie, Einzelbild-Ansicht, Mausrad-Zoom, scharfe interaktive
-#             Ansicht, einstellbare Bildhöhe und Bildauflösung.
+# Neu in 2.1: größere Galerie, Einzelbild-Ansicht, Mausrad-Zoom, Bildhöhe/-auflösung.
 # Neu in 2.2: Kontrast-Streckung für alle Modelle, kräftigere 3D-Schattierung.
-# Neu in 2.3: Tab "Flutung" (Wasserstand-Simulation, Uferlinie, Flutkurve,
-#             Strandlinien-Suche, Animation, 3D-Wasser, Export), Wasser in Karte & Profil.
+# Neu in 2.3: Tab "Flutung" (Wasserstand, Uferlinie, Flutkurve, Strandlinien, 3D, Export).
+# Neu in 2.4: Regionale Flutung auf der Karte (AWS Terrain Tiles), Animation als GIF,
+#             neues Design (Kopfzeile, Karten, Reiter, gruppierte Sidebar, Startseite).
 # =============================================================================
 from __future__ import annotations
 import base64, html, io, json, math, os, re, warnings
@@ -14,6 +14,7 @@ from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -53,18 +54,33 @@ try:
     PLY_OK = True
 except ImportError:
     PLY_OK = False
+try:
+    import requests
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
+APP_VERSION = "2.4"
 MAX_PIXELS = 6_000_000  # Speicherschutz (~2450 x 2450 px) – bei viel RAM erhöhen
 POINT_EXT = (".xyz", ".txt", ".csv", ".las", ".laz", ".ply")
 RASTER_EXT = (".tif", ".tiff", ".geotiff", ".asc")
 ESRI_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
             "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 LABEL_COLORS = {"auffällig": "#e41a1c", "möglich": "#ff7f00", "unklar": "#377eb8"}
 CIRCLE_T = np.linspace(0, 2 * np.pi, 37)
 GEOM_KEYS = ["r0", "c0", "r1", "c1", "rad_px"]
 FLOOD_MODES = ["Badewanne (alles unter dem Wasserstand)",
                "Zusammenhängend vom Kachelrand",
                "Zusammenhängend ab Startpunkt"]
+REGION_MODES = ["Badewanne (alles unter dem Wasserstand)",
+                "Zusammenhängend vom Regionsrand (z. B. Meer)",
+                "Zusammenhängend ab Startpunkt (aus Tab Flutung)"]
 DEFAULTS = dict(
     use_file_crs=True, epsg=25832, grid_res=1.0, agg_mode="Mittelwert", ground_only=True,
     morph_filter=False, morph_window_m=15.0, morph_threshold_m=1.5,
@@ -75,10 +91,34 @@ DEFAULTS = dict(
     det_lines=True, line_min_m=20.0, det_blobs=True, blob_d=(4.0, 30.0), blob_min_h=0.2,
     det_rings=False, ring_d=(10.0, 60.0),
     flood_mode=FLOOD_MODES[0], water_opacity=0.6, show_shore=True, flood_base="Hillshade",
+    map_water_tile=False, map_water_region=False, region_km=10, region_mode=REGION_MODES[0],
+    region_offset_on=True,
 )
 S = st.session_state
 for _k, _v in DEFAULTS.items():
     S.setdefault(_k, _v)
+
+# --- Design (ergänzt das Farbschema aus .streamlit/config.toml) ---------------
+st.markdown("""
+<style>
+.block-container {padding-top: 1.4rem; padding-bottom: 2rem; max-width: 1700px;}
+.app-header {background: linear-gradient(135deg, #4a3216 0%, #8b5a2b 55%, #c89b5a 100%);
+  color: #fff; padding: 18px 26px; border-radius: 14px; margin-bottom: 16px;
+  box-shadow: 0 4px 14px rgba(74, 50, 22, .25);}
+.app-header h1 {color: #fff !important; margin: 0; font-size: 1.9rem; padding: 0;}
+.app-header p {margin: 4px 0 0; opacity: .92; font-size: 1rem;}
+div[data-testid="stMetric"] {background: #fff; border: 1px solid #e6dccb; border-radius: 12px;
+  padding: 10px 14px; box-shadow: 0 1px 4px rgba(0, 0, 0, .05);}
+div[data-testid="stMetricValue"] {font-size: 1.3rem;}
+.stTabs [data-baseweb="tab-list"] {gap: 6px;}
+.stTabs [data-baseweb="tab"] {background: #f1e8da; border-radius: 10px 10px 0 0; padding: 8px 18px;}
+.stTabs [aria-selected="true"] {background: #8b5a2b !important;}
+.stTabs [aria-selected="true"] p {color: #fff !important; font-weight: 600;}
+section[data-testid="stSidebar"] {background: #f4ede2;}
+div[data-testid="stExpander"] {border-radius: 10px; background: #fff;}
+footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -822,12 +862,17 @@ def compute_flood(flood_key, _z, level, mode, seed_rc):
     return wet, depth
 
 
-def _water_png_raw(w, d, alpha):
-    dmax = float(np.percentile(d[w], 98)) if w.any() else 1.0
-    t = 0.35 + 0.65 * np.clip(d / max(dmax, 1e-3), 0, 1)
+def _water_rgba(w, d, alpha, dref=None):
+    if dref is None:
+        dref = float(np.percentile(d[w], 98)) if w.any() else 1.0
+    t = 0.35 + 0.65 * np.clip(d / max(dref, 1e-3), 0, 1)
     rgba = matplotlib.colormaps["Blues"](t, bytes=True)
     rgba[..., 3] = np.where(w, int(round(255 * alpha)), 0).astype(np.uint8)
-    return png_bytes(rgba)
+    return rgba
+
+
+def _water_png_raw(w, d, alpha):
+    return png_bytes(_water_rgba(w, d, alpha))
 
 
 @st.cache_resource(max_entries=12)
@@ -937,40 +982,124 @@ def lines_geojson(lines, crs, wgs84, props):
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
 
 
-def flood_animation(base_name, lo, hi, steps, mode, seed_rc, alpha):
-    """Plotly-Animation: Wasser steigt von 'lo' bis 'hi'."""
-    zs, s = stride_ds(grid.z, 500)
+def _gif_font(size):
+    try:
+        return ImageFont.truetype(fm.findfont("DejaVu Sans"), size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def flood_gif(base_name, lo, hi, steps, mode, seed_rc, alpha, duration_ms, max_dim=800):
+    """Animiertes GIF: Wasser steigt von 'lo' bis 'hi'."""
+    L = layers[base_name]
+    base_arr, s = display_array(L, grid, max_dim, S.hide_voids)
+    zs = grid.z[::s, ::s]
     seed_s = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
-    ext = img_extent(grid)
-    base = dict(source=data_uri(layer_png((models_key, base_name), layers[base_name], grid,
-                                          tuple(S.stretch), S.hide_voids, 600)), opacity=1.0, **ext)
-    levels = np.linspace(lo, hi, steps)
+    base_rgba = to_rgba(base_arr, L.cmap, *vrange(L, S.stretch))
+    bg = Image.new("RGBA", (base_rgba.shape[1], base_rgba.shape[0]), (255, 255, 255, 255))
+    base_img = Image.alpha_composite(bg, Image.fromarray(base_rgba, "RGBA"))
+    font = _gif_font(max(14, base_img.width // 30))
+    dref = max(hi - lo, 0.5)
     frames = []
-    for lv in levels:
+    for lv in np.linspace(lo, hi, steps):
         w = flood_wet(zs, lv, mode, seed_s)
         d = np.where(w, lv - zs, 0).astype(np.float32)
-        img = dict(source=data_uri(_water_png_raw(w, d, alpha)), opacity=1.0, **ext)
-        frames.append(go.Frame(name=f"{lv:.2f}", layout=dict(images=[base, img],
-                                                             title=dict(text=f"Wasserstand {lv:.2f} m"))))
-    fig = go.Figure(data=[go.Scatter(x=[grid.x_min, grid.x_max], y=[grid.y_min, grid.y_max],
-                                     mode="markers", opacity=0, hoverinfo="skip", showlegend=False)],
-                    frames=frames)
-    apply_xy_layout(fig, f"Wasserstand {levels[0]:.2f} m", S.view_height)
-    fig.update_layout(
-        images=frames[0].layout.images,
-        updatemenus=[dict(type="buttons", showactive=False, x=0, y=1.08, xanchor="left",
-                          buttons=[dict(label="▶ Abspielen", method="animate",
-                                        args=[None, dict(frame=dict(duration=500, redraw=True),
-                                                         fromcurrent=True, transition=dict(duration=0))]),
-                                   dict(label="⏸ Pause", method="animate",
-                                        args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                                           mode="immediate")])])],
-        sliders=[dict(currentvalue=dict(prefix="Wasserstand: ", suffix=" m"), pad=dict(t=40),
-                      steps=[dict(method="animate", label=f"{lv:.1f}",
-                                  args=[[f"{lv:.2f}"], dict(mode="immediate", frame=dict(duration=0, redraw=True),
-                                                            transition=dict(duration=0))])
-                             for lv in levels])])
-    return fig
+        frame = Image.alpha_composite(base_img, Image.fromarray(_water_rgba(w, d, alpha, dref), "RGBA"))
+        draw = ImageDraw.Draw(frame)
+        txt = f"Wasserstand {lv:.2f} m"
+        bx = draw.textbbox((0, 0), txt, font=font)
+        pad = 8
+        draw.rectangle([10, 10, 10 + bx[2] - bx[0] + 2 * pad, 10 + bx[3] - bx[1] + 2 * pad],
+                       fill=(40, 40, 40, 255))
+        draw.text((10 + pad - bx[0], 10 + pad - bx[1]), txt, fill=(255, 255, 255, 255), font=font)
+        frames.append(frame.convert("RGB").quantize(colors=255))
+    durations = [int(duration_ms)] * (len(frames) - 1) + [int(duration_ms) * 4]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                   duration=durations, loop=0)
+    return buf.getvalue()
+
+
+# =============================================================================
+# Regionales Höhenmodell (AWS Terrain Tiles, Terrarium-Format) für die Karte
+# =============================================================================
+def lonlat_to_tile(lon, lat, z):
+    n = 2.0 ** z
+    lon = np.asarray(lon, float)
+    lat = np.clip(np.asarray(lat, float), -85.0, 85.0)
+    x = (lon + 180.0) / 360.0 * n
+    y = (1.0 - np.arcsinh(np.tan(np.radians(lat))) / np.pi) / 2.0 * n
+    return x, y
+
+
+def tile_to_lonlat(x, y, z):
+    n = 2.0 ** z
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    return lon, lat
+
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def fetch_terrarium(z, x, y):
+    r = requests.get(TERRARIUM_URL.format(z=z, x=x, y=y), timeout=20)
+    r.raise_for_status()
+    a = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.float32)
+    return (a[..., 0] * 256.0 + a[..., 1] + a[..., 2] / 256.0 - 32768.0).astype(np.float32)
+
+
+@st.cache_data(show_spinner="Lade regionales Höhenmodell …", max_entries=4)
+def regional_dem(lat, lon, radius_km, max_tiles=36):
+    dlat = radius_km / 111.32
+    dlon = radius_km / (111.32 * max(math.cos(math.radians(lat)), 0.05))
+    for z in range(13, 4, -1):
+        x0, y0 = lonlat_to_tile(lon - dlon, lat + dlat, z)
+        x1, y1 = lonlat_to_tile(lon + dlon, lat - dlat, z)
+        tx0, ty0 = int(math.floor(float(x0))), int(math.floor(float(y0)))
+        tx1, ty1 = int(math.floor(float(x1))), int(math.floor(float(y1)))
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
+            break
+    rows = [np.hstack([fetch_terrarium(z, tx, ty) for tx in range(tx0, tx1 + 1)])
+            for ty in range(ty0, ty1 + 1)]
+    dem = np.vstack(rows)
+    lon_w, lat_n = tile_to_lonlat(tx0, ty0, z)
+    lon_e, lat_s = tile_to_lonlat(tx1 + 1, ty1 + 1, z)
+    res_m = 156543.03 * math.cos(math.radians(lat)) / 2 ** z
+    meta = dict(z=z, tx0=tx0, ty0=ty0, bounds=(lon_w, lat_n, lon_e, lat_s), res_m=res_m)
+    return dem, meta
+
+
+def dem_rowcol(meta, lon, lat):
+    px, py = lonlat_to_tile(lon, lat, meta["z"])
+    return (py - meta["ty0"]) * 256 - 0.5, (px - meta["tx0"]) * 256 - 0.5
+
+
+@st.cache_resource(max_entries=4)
+def regional_offset(key, _grid, crs, lat, lon, radius_km):
+    """Median-Höhendifferenz LiDAR-Kachel minus Regionalmodell (im Bereich der Kachel)."""
+    dem, meta = regional_dem(lat, lon, radius_km)
+    zs, s = stride_ds(_grid.z, 40)
+    xs, ys = ds_axes(_grid, zs.shape, s)
+    X, Y = np.meshgrid(xs, ys)
+    la, lo = to_latlon(X.ravel(), Y.ravel(), crs)
+    if la is None:
+        return 0.0
+    r, c = dem_rowcol(meta, lo, la)
+    d = ndimage.map_coordinates(dem, [r, c], order=1, mode="nearest")
+    return float(np.median(zs.ravel() - d))
+
+
+@st.cache_data(show_spinner="Berechne regionale Überflutung …", max_entries=6)
+def regional_water(lat, lon, radius_km, level, offset, mode_idx, seed_ll):
+    dem, meta = regional_dem(lat, lon, radius_km)
+    zz = dem + offset
+    seed = None
+    if mode_idx == 2 and seed_ll:
+        r, c = dem_rowcol(meta, seed_ll[0], seed_ll[1])
+        seed = (int(round(float(r))), int(round(float(c))))
+    wet = flood_wet(zz, level, FLOOD_MODES[mode_idx], seed)
+    depth = np.where(wet, level - zz, 0).astype(np.float32)
+    area_km2 = float(wet.sum()) * meta["res_m"] ** 2 / 1e6
+    return _water_png_raw(wet, depth, 1.0), meta["bounds"], area_km2, meta["res_m"]
 
 
 # =============================================================================
@@ -1053,8 +1182,8 @@ def build_report(names, fdf):
 # Sidebar
 # =============================================================================
 with st.sidebar:
-    st.header("⚙️ Parameter")
-    files = st.file_uploader("Dateien (Punktwolke(n) oder ein Raster)", accept_multiple_files=True,
+    st.markdown("## ⚙️ Steuerung")
+    files = st.file_uploader("📂 Dateien (Punktwolke(n) oder ein Raster)", accept_multiple_files=True,
                              type=[e[1:] for e in POINT_EXT + RASTER_EXT],
                              help="Mehrere LAS/LAZ/XYZ-Kacheln werden zu einem Mosaik zusammengesetzt.")
     with st.expander("💾 Projekt laden"):
@@ -1068,58 +1197,71 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Projektdatei ungültig: {e}")
 
-    st.subheader("🌍 Geo-Referenz")
-    st.checkbox("CRS aus Datei verwenden (falls vorhanden)", key="use_file_crs")
-    st.number_input("EPSG-Code (Fallback)", min_value=1, max_value=999999, step=1, key="epsg",
-                    help="25832 = UTM 32N · 25833 = UTM 33N · 2154 = Lambert-93 (IGN) · 2056 = CH LV95")
-    if not PYPROJ_OK:
-        st.warning("'pyproj' fehlt – Karte und Koordinaten deaktiviert.")
+    with st.expander("🌍 Geo-Referenz"):
+        st.checkbox("CRS aus Datei verwenden (falls vorhanden)", key="use_file_crs")
+        st.number_input("EPSG-Code (Fallback)", min_value=1, max_value=999999, step=1, key="epsg",
+                        help="25832 = UTM 32N · 25833 = UTM 33N · 2154 = Lambert-93 (IGN) · 2056 = CH LV95")
+        if not PYPROJ_OK:
+            st.warning("'pyproj' fehlt – Karte und Koordinaten deaktiviert.")
 
-    st.subheader("☁️ Punktwolke → Raster")
-    st.number_input("Auflösung (m)", min_value=0.1, max_value=10.0, step=0.1, key="grid_res")
-    st.selectbox("Aggregation pro Zelle", ["Mittelwert", "Minimum (robuster bei Vegetation)"], key="agg_mode")
-    st.checkbox("Nur Bodenpunkte (Klasse 2)", key="ground_only")
-    st.checkbox("Morphologischer Vegetationsfilter", key="morph_filter",
-                help="Entfernt Zellen, die deutlich über dem lokalen Minimum liegen (Bäume, Gebäude).")
-    st.slider("Filterfenster (m)", 3.0, 50.0, step=1.0, key="morph_window_m", disabled=not S.morph_filter)
-    st.slider("Filterschwelle (m)", 0.2, 5.0, step=0.1, key="morph_threshold_m", disabled=not S.morph_filter)
+    with st.expander("☁️ Punktwolke → Raster"):
+        st.number_input("Auflösung (m)", min_value=0.1, max_value=10.0, step=0.1, key="grid_res")
+        st.selectbox("Aggregation pro Zelle", ["Mittelwert", "Minimum (robuster bei Vegetation)"], key="agg_mode")
+        st.checkbox("Nur Bodenpunkte (Klasse 2)", key="ground_only")
+        st.checkbox("Morphologischer Vegetationsfilter", key="morph_filter",
+                    help="Entfernt Zellen, die deutlich über dem lokalen Minimum liegen (Bäume, Gebäude).")
+        st.slider("Filterfenster (m)", 3.0, 50.0, step=1.0, key="morph_window_m", disabled=not S.morph_filter)
+        st.slider("Filterschwelle (m)", 0.2, 5.0, step=0.1, key="morph_threshold_m", disabled=not S.morph_filter)
 
-    st.subheader("🏔️ Reliefmodelle")
-    st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth",
-              help="Gilt für Hillshade und für die Lichtrichtung in 3D.")
-    st.slider("Sonnenhöhe (°)", 5, 80, key="hs_altitude", help="Flaches Licht (10–25°) betont feine Wälle.")
-    st.slider("LRM-Glättung σ (m)", 2.0, 60.0, step=1.0, key="lrm_sigma_m")
-    st.checkbox("SVF & Openness berechnen (rechenintensiv)", key="enable_svf")
-    st.slider("Richtungen", 4, 16, key="svf_dirs", disabled=not S.enable_svf)
-    st.slider("Suchradius (m)", 5, 50, key="svf_radius_m", disabled=not S.enable_svf)
+    with st.expander("🏔️ Reliefmodelle", expanded=True):
+        st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth",
+                  help="Gilt für Hillshade und für die Lichtrichtung in 3D.")
+        st.slider("Sonnenhöhe (°)", 5, 80, key="hs_altitude", help="Flaches Licht (10–25°) betont feine Wälle.")
+        st.slider("LRM-Glättung σ (m)", 2.0, 60.0, step=1.0, key="lrm_sigma_m")
+        st.checkbox("SVF & Openness berechnen (rechenintensiv)", key="enable_svf")
+        st.slider("Richtungen", 4, 16, key="svf_dirs", disabled=not S.enable_svf)
+        st.slider("Suchradius (m)", 5, 50, key="svf_radius_m", disabled=not S.enable_svf)
 
-    st.subheader("🎨 Anzeige")
-    st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch",
-              help="Enger (z. B. 5–95) = kräftigerer Kontrast. Gilt für 2D, 3D, Karte und Bericht.")
-    st.checkbox("Große Datenlücken ausblenden", key="hide_voids")
-    st.slider("Z-Überhöhung (3D)", 0.5, 10.0, step=0.5, key="z_exag")
-    st.slider("Bildhöhe (px)", 400, 1600, step=50, key="view_height",
-              help="Höhe der interaktiven Ansicht, der Karte und der 3D-Ansicht.")
-    st.slider("Bildauflösung (px)", 800, 3000, step=100, key="view_px",
-              help="Höher = schärfer beim Hineinzoomen, aber langsamer.")
+    with st.expander("🎨 Anzeige"):
+        st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch",
+                  help="Enger (z. B. 5–95) = kräftigerer Kontrast. Gilt für 2D, 3D, Karte und Bericht.")
+        st.checkbox("Große Datenlücken ausblenden", key="hide_voids")
+        st.slider("Z-Überhöhung (3D)", 0.5, 10.0, step=0.5, key="z_exag")
+        st.slider("Bildhöhe (px)", 400, 1600, step=50, key="view_height",
+                  help="Höhe der interaktiven Ansicht, der Karte und der 3D-Ansicht.")
+        st.slider("Bildauflösung (px)", 800, 3000, step=100, key="view_px",
+                  help="Höher = schärfer beim Hineinzoomen, aber langsamer.")
 
-    st.subheader("🔍 Feature-Erkennung")
-    st.checkbox("Lineare Strukturen", key="det_lines")
-    st.slider("Min. Linienlänge (m)", 5.0, 200.0, step=5.0, key="line_min_m", disabled=not S.det_lines)
-    st.checkbox("Hügel & Senken", key="det_blobs")
-    st.slider("Durchmesser (m)", 2.0, 80.0, step=1.0, key="blob_d", disabled=not S.det_blobs)
-    st.slider("Min. Höhe/Tiefe (m)", 0.05, 2.0, step=0.05, key="blob_min_h", disabled=not S.det_blobs)
-    st.checkbox("Ringstrukturen", key="det_rings")
-    st.slider("Ring-Durchmesser (m)", 5.0, 150.0, step=5.0, key="ring_d", disabled=not S.det_rings)
+    with st.expander("🔍 Feature-Erkennung"):
+        st.checkbox("Lineare Strukturen", key="det_lines")
+        st.slider("Min. Linienlänge (m)", 5.0, 200.0, step=5.0, key="line_min_m", disabled=not S.det_lines)
+        st.checkbox("Hügel & Senken", key="det_blobs")
+        st.slider("Durchmesser (m)", 2.0, 80.0, step=1.0, key="blob_d", disabled=not S.det_blobs)
+        st.slider("Min. Höhe/Tiefe (m)", 0.05, 2.0, step=0.05, key="blob_min_h", disabled=not S.det_blobs)
+        st.checkbox("Ringstrukturen", key="det_rings")
+        st.slider("Ring-Durchmesser (m)", 5.0, 150.0, step=5.0, key="ring_d", disabled=not S.det_rings)
+
+    st.caption(f"LiDAR Archäologie Pro · Version {APP_VERSION}")
 
 
 # =============================================================================
 # Hauptbereich
 # =============================================================================
-st.title("🏛️ LiDAR Archäologie Pro")
+st.markdown("""<div class="app-header"><h1>🏛️ LiDAR Archäologie Pro</h1>
+<p>Reliefanalyse · Prospektion · Flutungssimulation</p></div>""", unsafe_allow_html=True)
+
 if not files:
-    st.info("Bitte eine oder mehrere Punktwolken (.las, .laz, .xyz, .txt, .csv, .ply) "
-            "oder ein Raster (.tif, .asc) hochladen.")
+    cards = [("📂", "1 · Daten laden", "Links in der Sidebar eine LAS/LAZ-Punktwolke oder ein "
+                                      "Höhenmodell (GeoTIFF, ASC) hochladen."),
+             ("🏔️", "2 · Relief erkunden", "Reliefmodelle in 2D, 3D und auf der Karte vergleichen, "
+                                         "Profile ziehen, Strukturen erkennen."),
+             ("🌊", "3 · Flutung simulieren", "Wasserstand verändern, Uferlinien prüfen, Strandlinien suchen "
+                                            "und Ergebnisse exportieren.")]
+    for col, (icon, title, text) in zip(st.columns(3), cards):
+        with col.container(border=True):
+            st.markdown(f"### {icon} {title}")
+            st.write(text)
+    st.info("⬅️ Starte mit einer Datei in der Sidebar.")
     st.stop()
 
 file_key = tuple(sorted((f.name, f.size) for f in files))
@@ -1283,8 +1425,38 @@ try:
             custom = st.text_input("Eigener XYZ/WMS-Layer (optional, z. B. historische Karte)",
                                    help="XYZ: https://…/{z}/{x}/{y}.png · WMS: GetMap-URL mit "
                                         "BBOX={bbox-epsg-3857}&SRS=EPSG:3857&WIDTH=256&HEIGHT=256")
-            show_water_map = st.checkbox(f"🌊 Wasserfläche einblenden (Wasserstand {S.water_level:.2f} m – "
-                                         "Einstellungen im Tab „Flutung“)", key="map_water")
+            st.markdown(f"**🌊 Wasser auf der Karte** – Wasserstand **{S.water_level:.2f} m** "
+                        "(einstellbar im Tab „Flutung“)")
+            w1, w2 = st.columns(2)
+            w1.checkbox("In der Kachel (LiDAR, genau)", key="map_water_tile")
+            w2.checkbox("In der ganzen Region (grobes Höhenmodell)", key="map_water_region")
+
+            region = None
+            if S.map_water_region:
+                r1, r2, r3 = st.columns(3)
+                r1.slider("Regionsradius (km)", 2, 50, step=1, key="region_km")
+                r2.selectbox("Ausbreitung", REGION_MODES, key="region_mode")
+                r3.checkbox("Höhenversatz zur Kachel ausgleichen", key="region_offset_on",
+                            help="Vergleicht das Regionalmodell mit deinen LiDAR-Daten im Bereich der Kachel "
+                                 "und gleicht den mittleren Höhenunterschied aus.")
+                if not (REQUESTS_OK and PIL_OK):
+                    st.warning("Für das Regionalmodell werden 'requests' und 'Pillow' benötigt.")
+                else:
+                    try:
+                        lat_c, lon_c = round(float(latlon[0]), 4), round(float(latlon[1]), 4)
+                        rkm = int(S.region_km)
+                        off = (regional_offset((grid_key, str(crs), lat_c, lon_c, rkm), grid, crs,
+                                               lat_c, lon_c, rkm) if S.region_offset_on else 0.0)
+                        rmode = S.region_mode if S.region_mode in REGION_MODES else REGION_MODES[0]
+                        sll = to_latlon(S.seed_x, S.seed_y, crs)
+                        seed_ll = ((round(float(sll[1]), 6), round(float(sll[0]), 6))
+                                   if sll[0] is not None else None)
+                        rpng, rb, rarea, rres = regional_water(lat_c, lon_c, rkm, round(float(S.water_level), 2),
+                                                               round(off, 2), REGION_MODES.index(rmode), seed_ll)
+                        region = dict(png=rpng, bounds=rb, area=rarea, res=rres, offset=off)
+                    except Exception as e:
+                        st.warning(f"Regionales Höhenmodell konnte nicht geladen werden: {e}")
+
             cx = [grid.x_min, grid.x_max, grid.x_max, grid.x_min]
             cy = [grid.y_max, grid.y_max, grid.y_min, grid.y_min]
             clat, clon = to_latlon(np.array(cx), np.array(cy), crs)
@@ -1297,15 +1469,21 @@ try:
                                     sourceattribution="Esri World Imagery"))
             if custom.strip():
                 mlayers.append(dict(sourcetype="raster", source=[custom.strip()], below="traces"))
+            if region:
+                lw, ln_, le, ls_ = region["bounds"]
+                mlayers.append(dict(sourcetype="image", source=data_uri(region["png"]),
+                                    opacity=float(S.water_opacity), below="traces",
+                                    coordinates=[[lw, ln_], [le, ln_], [le, ls_], [lw, ls_]]))
             mlayers.append(dict(sourcetype="image", source=uri, opacity=op, below="traces", coordinates=corners))
-            if show_water_map and wet.any():
+            if S.map_water_tile and wet.any():
                 wuri = data_uri(water_png((flood_key, int(S.view_px), 1.0), wet, depth, int(S.view_px), 1.0))
                 mlayers.append(dict(sourcetype="image", source=wuri, opacity=float(S.water_opacity),
                                     below="traces", coordinates=corners))
             use_new = hasattr(go, "Scattermap")
             Scatter = go.Scattermap if use_new else go.Scattermapbox
-            fig_m = go.Figure(Scatter(lat=[latlon[0]], lon=[latlon[1]], mode="markers", name="Zentrum",
-                                      marker=dict(size=8, color="black")))
+            fig_m = go.Figure(Scatter(lat=list(clat) + [clat[0]], lon=list(clon) + [clon[0]], mode="lines",
+                                      name="LiDAR-Kachel", line=dict(color="#8b5a2b", width=2),
+                                      hoverinfo="skip"))
             fdf_map = features_df(feats, crs)
             if len(fdf_map) and "Lat" in fdf_map:
                 for label, color in LABEL_COLORS.items():
@@ -1315,12 +1493,22 @@ try:
                                                 marker=dict(size=9, color=color),
                                                 text=[f"#{i} {t} · {g} m" for i, t, g in
                                                       zip(sub["ID"], sub["Typ"], sub["Größe_m"])]))
-            zoom = float(np.clip(math.log2(360 / max(np.ptp(clon), 1e-6)) + 1.5, 1, 19))
+            span = (region["bounds"][2] - region["bounds"][0]) if region else max(np.ptp(clon), 1e-6)
+            zoom = float(np.clip(math.log2(360 / span) + (0.8 if region else 1.5), 1, 19))
             fig_m.update_layout(**{"map" if use_new else "mapbox": dict(
                 style="white-bg" if base != "OpenStreetMap" else "open-street-map",
                 center=dict(lat=latlon[0], lon=latlon[1]), zoom=zoom, layers=mlayers)},
                 height=int(S.view_height), margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h"))
             show_plot(fig_m)
+            if region:
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Überflutet in der Region", f"{region['area']:,.1f} km²".replace(",", "."))
+                k2.metric("Auflösung Regionalmodell", f"≈ {region['res']:.0f} m")
+                k3.metric("Höhenversatz Kachel ↔ Region", f"{region['offset']:+.2f} m")
+                st.caption("🌍 Regionalmodell: AWS Terrain Tiles (Mapzen, u. a. SRTM). Grobe Auflösung, "
+                           "Höhenfehler von mehreren Metern möglich, teils mit Bewuchs und Bebauung. Deiche, "
+                           "Dämme und kleine Täler werden nicht erfasst. Innerhalb der Kachel gilt das genauere "
+                           "LiDAR-Wasser (Häkchen „In der Kachel“).")
             st.caption("🖱️ Mausrad = Zoom · Ziehen = Verschieben. Das Overlay wird über seine Eckpunkte "
                        "eingepasst (für Kacheln bis einige km ausreichend genau).")
 
@@ -1445,7 +1633,7 @@ try:
                                lines, S.show_shore, S.view_height))
         st.caption("🖱️ Mausrad = Zoom · beim Überfahren: Höhe und Wassertiefe. "
                    "💡 Tipp: Hintergrund „Restrelief (LRM)“ + Uferlinie zeigt, ob die Uferlinie an "
-                   "Geländekanten (mögliche Terrassen) entlangläuft.")
+                   "Geländekanten (mögliche Terrassen) entlangläuft. Wasser über die ganze Region: Tab „Karte“.")
 
         with st.expander("📈 Flutkurve – Fläche und Volumen je Wasserstand"):
             hyp = hypsometry(grid_key, grid.z, grid.res)
@@ -1501,24 +1689,31 @@ try:
                            "Luftbild. Aussagekräftig wird es, wenn dieselbe Höhe in **mehreren Kacheln** auftaucht.")
 
         with st.expander("🎬 Animation – Wasser steigen lassen"):
-            a1, a2, a3 = st.columns(3)
-            lo = a1.number_input("Von (m)", value=float(round(zmin, 2)), format="%.2f", key="anim_lo")
-            hi = a2.number_input("Bis (m)", value=float(round(zmin + 0.5 * rng, 2)), format="%.2f", key="anim_hi")
-            steps = a3.slider("Schritte", 6, 30, 15, key="anim_steps")
-            spec = (models_key, S.flood_base, round(lo, 3), round(hi, 3), steps, flood_mode,
-                    seed_rc if flood_mode == FLOOD_MODES[2] else None, float(S.water_opacity), tuple(S.stretch))
-            if st.button("🎬 Animation erzeugen"):
-                if hi <= lo:
-                    st.warning("„Bis“ muss größer sein als „Von“.")
-                else:
-                    with st.spinner("Erzeuge Animation …"):
-                        S["_flood_anim"] = (spec, flood_animation(S.flood_base, lo, hi, steps, flood_mode,
-                                                                  seed_rc, float(S.water_opacity)))
-            anim = S.get("_flood_anim")
-            if anim and anim[0] == spec:
-                show_plot(anim[1])
-                st.caption("▶ Abspielen startet die Animation, mit dem Schieberegler springst du zu einer Höhe. "
-                           "Die Animation nutzt eine reduzierte Auflösung.")
+            if not PIL_OK:
+                st.warning("Für die Animation wird 'Pillow' benötigt.")
+            else:
+                a1, a2, a3, a4 = st.columns(4)
+                lo = a1.number_input("Von (m)", value=float(round(zmin, 2)), format="%.2f", key="anim_lo")
+                hi = a2.number_input("Bis (m)", value=float(round(zmin + 0.5 * rng, 2)), format="%.2f",
+                                     key="anim_hi")
+                steps = a3.slider("Bilder", 6, 40, 15, key="anim_steps")
+                speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel",
+                                         key="anim_speed")
+                dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
+                spec = (models_key, S.flood_base, round(lo, 3), round(hi, 3), steps, dur, flood_mode,
+                        seed_rc if flood_mode == FLOOD_MODES[2] else None, float(S.water_opacity),
+                        tuple(S.stretch))
+                if st.button("🎬 Animation erzeugen"):
+                    if hi <= lo:
+                        st.warning("„Bis“ muss größer sein als „Von“.")
+                    else:
+                        with st.spinner("Erzeuge Animation …"):
+                            S["_flood_gif"] = (spec, flood_gif(S.flood_base, lo, hi, steps, flood_mode,
+                                                               seed_rc, float(S.water_opacity), dur))
+                g = S.get("_flood_gif")
+                if g and g[0] == spec:
+                    st.image(g[1], caption="Die Animation läuft automatisch in Schleife.")
+                    st.download_button("⬇️ Animation als GIF herunterladen", g[1], "flutung.gif", "image/gif")
 
         with st.expander("🌐 3D-Ansicht mit Wasser"):
             if st.checkbox("3D-Ansicht berechnen", key="flood_3d_on"):
@@ -1617,7 +1812,7 @@ try:
         lazy_download("HTML-Bericht erzeugen", (feat_key, tuple(rep), tuple(S.stretch)),
                       lambda: build_report(rep, features_df(feats, crs)), "lidar_bericht.html", "text/html")
         st.download_button("💾 Projekt speichern (.json)", json.dumps(
-            {"app": "LiDAR Archäologie Pro 2.3", "dateien": [f.name for f in files], "crs": crs,
+            {"app": f"LiDAR Archäologie Pro {APP_VERSION}", "dateien": [f.name for f in files], "crs": crs,
              "parameter": {k: S[k] for k in DEFAULTS}}, ensure_ascii=False, indent=2).encode("utf-8"),
             "lidar_projekt.json", "application/json")
 
@@ -1625,4 +1820,3 @@ except Exception as e:
     st.error(f"Fehler bei der Analyse: {e}")
     with st.expander("Technische Details"):
         st.exception(e)
-
