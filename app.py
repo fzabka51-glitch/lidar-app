@@ -1,11 +1,13 @@
 # =============================================================================
-# app.py – LiDAR Archäologie Pro 2.4 (eine Datei, ersetzt importers/archaeology/exporters)
+# app.py – LiDAR Archäologie Pro 2.5 (eine Datei, ersetzt importers/archaeology/exporters)
 # Konvention: Raster intern "Nord oben" (Zeile 0 = Norden), alle Parameter in Metern.
 # Neu in 2.1: größere Galerie, Einzelbild-Ansicht, Mausrad-Zoom, Bildhöhe/-auflösung.
 # Neu in 2.2: Kontrast-Streckung für alle Modelle, kräftigere 3D-Schattierung.
 # Neu in 2.3: Tab "Flutung" (Wasserstand, Uferlinie, Flutkurve, Strandlinien, 3D, Export).
-# Neu in 2.4: Regionale Flutung auf der Karte (AWS Terrain Tiles), Animation als GIF,
-#             neues Design (Kopfzeile, Karten, Reiter, gruppierte Sidebar, Startseite).
+# Neu in 2.4: Regionale Flutung auf der Karte (AWS Terrain Tiles), neues Design.
+# Neu in 2.5: Wasser wird mit dem Relief zu einem Bild verschmolzen (sicher sichtbar),
+#             kräftigere Wasserfarbe, Animation wieder mit Play/Pause/Schieberegler
+#             (Bedienung unter dem Bild), GIF als optionaler Download.
 # =============================================================================
 from __future__ import annotations
 import base64, html, io, json, math, os, re, warnings
@@ -16,6 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -65,7 +68,7 @@ try:
 except ImportError:
     PIL_OK = False
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 MAX_PIXELS = 6_000_000  # Speicherschutz (~2450 x 2450 px) – bei viel RAM erhöhen
 POINT_EXT = (".xyz", ".txt", ".csv", ".las", ".laz", ".ply")
 RASTER_EXT = (".tif", ".tiff", ".geotiff", ".asc")
@@ -75,6 +78,7 @@ TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}
 LABEL_COLORS = {"auffällig": "#e41a1c", "möglich": "#ff7f00", "unklar": "#377eb8"}
 CIRCLE_T = np.linspace(0, 2 * np.pi, 37)
 GEOM_KEYS = ["r0", "c0", "r1", "c1", "rad_px"]
+WATER_CMAP = LinearSegmentedColormap.from_list("wasser", ["#6ec1f5", "#1f78d1", "#08306b"])
 FLOOD_MODES = ["Badewanne (alles unter dem Wasserstand)",
                "Zusammenhängend vom Kachelrand",
                "Zusammenhängend ab Startpunkt"]
@@ -90,7 +94,7 @@ DEFAULTS = dict(
     shade_3d=0.7,
     det_lines=True, line_min_m=20.0, det_blobs=True, blob_d=(4.0, 30.0), blob_min_h=0.2,
     det_rings=False, ring_d=(10.0, 60.0),
-    flood_mode=FLOOD_MODES[0], water_opacity=0.6, show_shore=True, flood_base="Hillshade",
+    flood_mode=FLOOD_MODES[0], water_opacity=0.7, show_shore=True, flood_base="Hillshade",
     map_water_tile=False, map_water_region=False, region_km=10, region_mode=REGION_MODES[0],
     region_offset_on=True,
 )
@@ -654,6 +658,17 @@ def data_uri(png):
     return "data:image/png;base64," + base64.b64encode(png).decode()
 
 
+def composite_rgba(base, top):
+    """Legt 'top' (RGBA, mit Transparenz) über 'base' (RGBA) – Ergebnis ist ein deckendes Bild."""
+    b = base.astype(np.float32) / 255.0
+    t = top.astype(np.float32) / 255.0
+    ba, ta = b[..., 3:4], t[..., 3:4]
+    b_rgb = b[..., :3] * ba + (1.0 - ba)          # transparente Stellen -> weiß
+    rgb = t[..., :3] * ta + b_rgb * (1.0 - ta)
+    out = np.concatenate([rgb, np.ones_like(ta)], axis=-1)
+    return (out * 255.0 + 0.5).astype(np.uint8)
+
+
 PLOTLY_CONFIG = {"scrollZoom": True, "displaylogo": False,
                  "toImageButtonOptions": {"format": "png", "scale": 2}}
 
@@ -863,10 +878,11 @@ def compute_flood(flood_key, _z, level, mode, seed_rc):
 
 
 def _water_rgba(w, d, alpha, dref=None):
+    """Wasser als RGBA: hellblau (flach) bis dunkelblau (tief), trockene Zellen transparent."""
     if dref is None:
-        dref = float(np.percentile(d[w], 98)) if w.any() else 1.0
-    t = 0.35 + 0.65 * np.clip(d / max(dref, 1e-3), 0, 1)
-    rgba = matplotlib.colormaps["Blues"](t, bytes=True)
+        dref = float(np.percentile(d[w], 95)) if w.any() else 1.0
+    t = np.clip(d / max(dref, 1e-3), 0, 1)
+    rgba = WATER_CMAP(t, bytes=True)
     rgba[..., 3] = np.where(w, int(round(255 * alpha)), 0).astype(np.uint8)
     return rgba
 
@@ -877,8 +893,18 @@ def _water_png_raw(w, d, alpha):
 
 @st.cache_resource(max_entries=12)
 def water_png(key, _wet, _depth, max_dim, alpha):
+    """Nur Wasser (transparent) – für die Karte."""
     w, s = stride_ds(_wet, max_dim)
     return _water_png_raw(w, _depth[::s, ::s], alpha)
+
+
+@st.cache_resource(max_entries=6)
+def flood_png(key, _L, _grid, _wet, _depth, stretch, hide, max_dim, alpha):
+    """Relief + Wasser zu EINEM deckenden Bild verschmolzen."""
+    base_arr, s = display_array(_L, _grid, max_dim, hide)
+    base_rgba = to_rgba(base_arr, _L.cmap, *vrange(_L, stretch))
+    water = _water_rgba(_wet[::s, ::s], _depth[::s, ::s], alpha)
+    return png_bytes(composite_rgba(base_rgba, water))
 
 
 @st.cache_resource(max_entries=3)
@@ -907,12 +933,9 @@ def shore_trace(lines):
 
 def flood_figure(title, base_name, wet, depth, lines, show_shore, height):
     fig = go.Figure()
-    base_png = layer_png((models_key, base_name), layers[base_name], grid, tuple(S.stretch),
-                         S.hide_voids, int(S.view_px))
-    fig.add_layout_image(source=data_uri(base_png), opacity=1.0, **img_extent(grid))
-    wpng = water_png((flood_key, int(S.view_px), float(S.water_opacity)), wet, depth,
-                     int(S.view_px), float(S.water_opacity))
-    fig.add_layout_image(source=data_uri(wpng), opacity=1.0, **img_extent(grid))
+    png = flood_png((models_key, flood_key, base_name), layers[base_name], grid, wet, depth,
+                    tuple(S.stretch), bool(S.hide_voids), int(S.view_px), float(S.water_opacity))
+    fig.add_layout_image(source=data_uri(png), opacity=1.0, **img_extent(grid))
     hz, s = stride_ds(grid.z, 300)
     hw, hd = wet[::s, ::s], depth[::s, ::s]
     txt = np.where(hw, np.char.mod("Wassertiefe %.2f m", hd), "trocken")
@@ -982,6 +1005,56 @@ def lines_geojson(lines, crs, wgs84, props):
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
 
 
+# --- Animation -----------------------------------------------------------------
+def flood_frames(base_name, lo, hi, steps, mode, seed_rc, alpha, max_dim=600):
+    """Liste von (Wasserstand, RGBA-Bild) – Relief und Wasser bereits verschmolzen."""
+    L = layers[base_name]
+    base_arr, s = display_array(L, grid, max_dim, S.hide_voids)
+    base_rgba = to_rgba(base_arr, L.cmap, *vrange(L, S.stretch))
+    zs = grid.z[::s, ::s]
+    seed_s = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
+    dref = max(hi - lo, 0.5)
+    out = []
+    for lv in np.linspace(lo, hi, steps):
+        w = flood_wet(zs, lv, mode, seed_s)
+        d = np.where(w, lv - zs, 0).astype(np.float32)
+        out.append((float(lv), composite_rgba(base_rgba, _water_rgba(w, d, alpha, dref))))
+    return out
+
+
+def flood_anim_figure(frames, duration_ms):
+    """Plotly-Animation mit Play/Pause und Schieberegler UNTER dem Bild."""
+    ext = img_extent(grid)
+    imgs = [dict(source=data_uri(png_bytes(rgba)), opacity=1.0, **ext) for _, rgba in frames]
+    fr = [go.Frame(name=f"{lv:.3f}", layout=dict(images=[im], title=dict(text=f"Wasserstand {lv:.2f} m")))
+          for (lv, _), im in zip(frames, imgs)]
+    fig = go.Figure(data=[go.Scatter(x=[grid.x_min, grid.x_max], y=[grid.y_min, grid.y_max],
+                                     mode="markers", opacity=0, hoverinfo="skip", showlegend=False)],
+                    frames=fr)
+    apply_xy_layout(fig, f"Wasserstand {frames[0][0]:.2f} m", S.view_height)
+    play = dict(label="▶ Abspielen", method="animate",
+                args=[None, dict(frame=dict(duration=int(duration_ms), redraw=True), fromcurrent=True,
+                                 transition=dict(duration=0), mode="immediate")])
+    pause = dict(label="⏸ Pause", method="animate",
+                 args=[[None], dict(frame=dict(duration=0, redraw=False), transition=dict(duration=0),
+                                    mode="immediate")])
+    fig.update_layout(
+        images=[imgs[0]],
+        margin=dict(l=10, r=10, t=50, b=140),
+        xaxis_title=None,
+        updatemenus=[dict(type="buttons", direction="left", showactive=False,
+                          x=0.0, xanchor="left", y=-0.03, yanchor="top",
+                          pad=dict(r=10, t=10), buttons=[play, pause])],
+        sliders=[dict(active=0, x=0.25, len=0.75, xanchor="left", y=-0.03, yanchor="top",
+                      pad=dict(t=10, b=10),
+                      currentvalue=dict(prefix="Wasserstand: ", suffix=" m", visible=True),
+                      steps=[dict(method="animate", label=f"{lv:.1f}",
+                                  args=[[f"{lv:.3f}"], dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                                                            transition=dict(duration=0))])
+                             for lv, _ in frames])])
+    return fig
+
+
 def _gif_font(size):
     try:
         return ImageFont.truetype(fm.findfont("DejaVu Sans"), size)
@@ -989,34 +1062,25 @@ def _gif_font(size):
         return ImageFont.load_default()
 
 
-def flood_gif(base_name, lo, hi, steps, mode, seed_rc, alpha, duration_ms, max_dim=800):
-    """Animiertes GIF: Wasser steigt von 'lo' bis 'hi'."""
-    L = layers[base_name]
-    base_arr, s = display_array(L, grid, max_dim, S.hide_voids)
-    zs = grid.z[::s, ::s]
-    seed_s = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
-    base_rgba = to_rgba(base_arr, L.cmap, *vrange(L, S.stretch))
-    bg = Image.new("RGBA", (base_rgba.shape[1], base_rgba.shape[0]), (255, 255, 255, 255))
-    base_img = Image.alpha_composite(bg, Image.fromarray(base_rgba, "RGBA"))
-    font = _gif_font(max(14, base_img.width // 30))
-    dref = max(hi - lo, 0.5)
-    frames = []
-    for lv in np.linspace(lo, hi, steps):
-        w = flood_wet(zs, lv, mode, seed_s)
-        d = np.where(w, lv - zs, 0).astype(np.float32)
-        frame = Image.alpha_composite(base_img, Image.fromarray(_water_rgba(w, d, alpha, dref), "RGBA"))
-        draw = ImageDraw.Draw(frame)
+def frames_to_gif(frames, duration_ms):
+    """Animiertes GIF aus den Animationsbildern (mit eingeblendetem Wasserstand)."""
+    pil_frames = []
+    font = None
+    for lv, rgba in frames:
+        img = Image.fromarray(rgba, "RGBA").convert("RGB")
+        if font is None:
+            font = _gif_font(max(14, img.width // 30))
+        draw = ImageDraw.Draw(img)
         txt = f"Wasserstand {lv:.2f} m"
         bx = draw.textbbox((0, 0), txt, font=font)
         pad = 8
-        draw.rectangle([10, 10, 10 + bx[2] - bx[0] + 2 * pad, 10 + bx[3] - bx[1] + 2 * pad],
-                       fill=(40, 40, 40, 255))
-        draw.text((10 + pad - bx[0], 10 + pad - bx[1]), txt, fill=(255, 255, 255, 255), font=font)
-        frames.append(frame.convert("RGB").quantize(colors=255))
-    durations = [int(duration_ms)] * (len(frames) - 1) + [int(duration_ms) * 4]
+        draw.rectangle([10, 10, 10 + bx[2] - bx[0] + 2 * pad, 10 + bx[3] - bx[1] + 2 * pad], fill=(40, 40, 40))
+        draw.text((10 + pad - bx[0], 10 + pad - bx[1]), txt, fill=(255, 255, 255), font=font)
+        pil_frames.append(img.quantize(colors=255))
+    durations = [int(duration_ms)] * (len(pil_frames) - 1) + [int(duration_ms) * 4]
     buf = io.BytesIO()
-    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
-                   duration=durations, loop=0)
+    pil_frames[0].save(buf, format="GIF", save_all=True, append_images=pil_frames[1:],
+                       duration=durations, loop=0)
     return buf.getvalue()
 
 
@@ -1631,8 +1695,8 @@ try:
         lines = shore_lines(flood_key, wet, grid)
         show_plot(flood_figure(f"Wasserstand {S.water_level:.2f} m", S.flood_base, wet, depth,
                                lines, S.show_shore, S.view_height))
-        st.caption("🖱️ Mausrad = Zoom · beim Überfahren: Höhe und Wassertiefe. "
-                   "💡 Tipp: Hintergrund „Restrelief (LRM)“ + Uferlinie zeigt, ob die Uferlinie an "
+        st.caption("🖱️ Mausrad = Zoom · beim Überfahren: Höhe und Wassertiefe · Hellblau = flach, "
+                   "Dunkelblau = tief. 💡 Hintergrund „Restrelief (LRM)“ + Uferlinie zeigt, ob die Uferlinie an "
                    "Geländekanten (mögliche Terrassen) entlangläuft. Wasser über die ganze Region: Tab „Karte“.")
 
         with st.expander("📈 Flutkurve – Fläche und Volumen je Wasserstand"):
@@ -1689,31 +1753,33 @@ try:
                            "Luftbild. Aussagekräftig wird es, wenn dieselbe Höhe in **mehreren Kacheln** auftaucht.")
 
         with st.expander("🎬 Animation – Wasser steigen lassen"):
-            if not PIL_OK:
-                st.warning("Für die Animation wird 'Pillow' benötigt.")
-            else:
-                a1, a2, a3, a4 = st.columns(4)
-                lo = a1.number_input("Von (m)", value=float(round(zmin, 2)), format="%.2f", key="anim_lo")
-                hi = a2.number_input("Bis (m)", value=float(round(zmin + 0.5 * rng, 2)), format="%.2f",
-                                     key="anim_hi")
-                steps = a3.slider("Bilder", 6, 40, 15, key="anim_steps")
-                speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel",
-                                         key="anim_speed")
-                dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
-                spec = (models_key, S.flood_base, round(lo, 3), round(hi, 3), steps, dur, flood_mode,
-                        seed_rc if flood_mode == FLOOD_MODES[2] else None, float(S.water_opacity),
-                        tuple(S.stretch))
-                if st.button("🎬 Animation erzeugen"):
-                    if hi <= lo:
-                        st.warning("„Bis“ muss größer sein als „Von“.")
-                    else:
-                        with st.spinner("Erzeuge Animation …"):
-                            S["_flood_gif"] = (spec, flood_gif(S.flood_base, lo, hi, steps, flood_mode,
-                                                               seed_rc, float(S.water_opacity), dur))
-                g = S.get("_flood_gif")
-                if g and g[0] == spec:
-                    st.image(g[1], caption="Die Animation läuft automatisch in Schleife.")
-                    st.download_button("⬇️ Animation als GIF herunterladen", g[1], "flutung.gif", "image/gif")
+            a1, a2, a3, a4 = st.columns(4)
+            lo = a1.number_input("Von (m)", value=float(round(zmin, 2)), format="%.2f", key="anim_lo")
+            hi = a2.number_input("Bis (m)", value=float(round(zmin + 0.5 * rng, 2)), format="%.2f",
+                                 key="anim_hi")
+            steps = a3.slider("Bilder", 6, 30, 15, key="anim_steps")
+            speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel",
+                                     key="anim_speed")
+            dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
+            spec = (models_key, S.flood_base, round(lo, 3), round(hi, 3), steps, dur, flood_mode,
+                    seed_rc if flood_mode == FLOOD_MODES[2] else None, float(S.water_opacity),
+                    tuple(S.stretch))
+            if st.button("🎬 Animation erzeugen"):
+                if hi <= lo:
+                    st.warning("„Bis“ muss größer sein als „Von“.")
+                else:
+                    with st.spinner("Erzeuge Animation …"):
+                        frames = flood_frames(S.flood_base, lo, hi, steps, flood_mode, seed_rc,
+                                              float(S.water_opacity))
+                        S["_flood_anim"] = (spec, flood_anim_figure(frames, dur), frames)
+            anim = S.get("_flood_anim")
+            if anim and anim[0] == spec:
+                show_plot(anim[1])
+                st.caption("▶ Abspielen / ⏸ Pause und der Schieberegler befinden sich **unter dem Bild**. "
+                           "Mit dem Schieberegler kannst du auch Bild für Bild durchgehen.")
+                if PIL_OK:
+                    lazy_download("GIF für Präsentationen erzeugen", spec,
+                                  lambda: frames_to_gif(anim[2], dur), "flutung.gif", "image/gif")
 
         with st.expander("🌐 3D-Ansicht mit Wasser"):
             if st.checkbox("3D-Ansicht berechnen", key="flood_3d_on"):
@@ -1820,3 +1886,4 @@ except Exception as e:
     st.error(f"Fehler bei der Analyse: {e}")
     with st.expander("Technische Details"):
         st.exception(e)
+
