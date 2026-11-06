@@ -1,19 +1,24 @@
 # =============================================================================
-# app.py – LiDAR Archäologie Pro 2.2 (eine Datei, ersetzt importers/archaeology/exporters)
+# app.py – LiDAR Archäologie Pro 2.6 (eine Datei)
 # Konvention: Raster intern "Nord oben" (Zeile 0 = Norden), alle Parameter in Metern.
-# Neu in 2.1: größere Galerie, Einzelbild-Ansicht, Mausrad-Zoom, scharfe interaktive
-#             Ansicht, einstellbare Bildhöhe und Bildauflösung.
-# Neu in 2.2: Kontrast-Streckung für alle Modelle, kräftigere 3D-Schattierung mit
-#             Lichtrichtung aus der Sidebar, Regler "Schattierung" im 3D-Tab.
+# 2.1–2.5: Galerie, Kontrast, Flutung, Regionale Flutung, Animation (siehe frühere Versionen).
+# Neu in 2.6: Stabilität – Reliefmodelle werden einzeln berechnet und zwischengespeichert
+#             (ein Regler rechnet nur noch "sein" Modell neu), Speicherschutz 3 Mio. Pixel,
+#             hochgeladene Dateien werden nicht mehr doppelt im Speicher gehalten,
+#             Animation speichert nur noch PNGs. Wartung – width="stretch" statt
+#             use_container_width, Regionalkacheln mit Fehlerbehandlung, eindeutiger
+#             Bild-Cache. Neu – Punktdichte mit Auflösungsvorschlag, Warnung bei großen Uploads.
 # =============================================================================
 from __future__ import annotations
-import base64, html, io, json, math, os, re, warnings
+import base64, gc, html, io, json, math, os, re, warnings
 from dataclasses import dataclass
 from datetime import datetime
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -43,6 +48,7 @@ except ImportError:
 try:
     from skimage.feature import blob_log, canny
     from skimage.transform import hough_circle, hough_circle_peaks, probabilistic_hough_line
+    from skimage.measure import find_contours
     SKIMAGE_OK = True
 except ImportError:
     SKIMAGE_OK = False
@@ -51,15 +57,40 @@ try:
     PLY_OK = True
 except ImportError:
     PLY_OK = False
+try:
+    import requests
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
 
-MAX_PIXELS = 6_000_000  # Speicherschutz (~2450 x 2450 px) – bei viel RAM erhöhen
+APP_VERSION = "2.6"
+MAX_PIXELS = 3_000_000          # Speicherschutz (~1730 x 1730 px) – bei lokalem Betrieb erhöhbar
+BIG_UPLOAD_MB = 500             # ab dieser Gesamtgröße Warnung (Streamlit Cloud ~1 GB RAM)
 POINT_EXT = (".xyz", ".txt", ".csv", ".las", ".laz", ".ply")
 RASTER_EXT = (".tif", ".tiff", ".geotiff", ".asc")
 ESRI_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
             "World_Imagery/MapServer/tile/{z}/{y}/{x}")
+TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 LABEL_COLORS = {"auffällig": "#e41a1c", "möglich": "#ff7f00", "unklar": "#377eb8"}
 CIRCLE_T = np.linspace(0, 2 * np.pi, 37)
 GEOM_KEYS = ["r0", "c0", "r1", "c1", "rad_px"]
+WATER_CMAP = LinearSegmentedColormap.from_list("wasser", ["#6ec1f5", "#1f78d1", "#08306b"])
+FLOOD_MODES = ["Badewanne (alles unter dem Wasserstand)",
+               "Zusammenhängend vom Kachelrand",
+               "Zusammenhängend ab Startpunkt"]
+REGION_MODES = ["Badewanne (alles unter dem Wasserstand)",
+                "Zusammenhängend vom Regionsrand (z. B. Meer)",
+                "Zusammenhängend ab Startpunkt (aus Tab Flutung)"]
+BASE_NAMES = ["Final Composite (Fusion)", "VAT-ähnliche Fusion", "Hillshade", "MDS Composite",
+              "Restrelief (LRM)", "Multi-Skalen-Relief", "Hangneigung (Slope)", "Krümmung (Curvature)",
+              "Hangausrichtung (Aspect)"]
+SVF_NAMES = ["Sky-View-Factor (SVF)", "Positive Openness", "Negative Openness"]
+DTM_NAME = "DTM (Höhe)"
 DEFAULTS = dict(
     use_file_crs=True, epsg=25832, grid_res=1.0, agg_mode="Mittelwert", ground_only=True,
     morph_filter=False, morph_window_m=15.0, morph_threshold_m=1.5,
@@ -69,11 +100,36 @@ DEFAULTS = dict(
     shade_3d=0.7,
     det_lines=True, line_min_m=20.0, det_blobs=True, blob_d=(4.0, 30.0), blob_min_h=0.2,
     det_rings=False, ring_d=(10.0, 60.0),
+    flood_mode=FLOOD_MODES[0], water_opacity=0.7, show_shore=True, flood_base="Hillshade",
+    map_water_tile=False, map_water_region=False, region_km=10, region_mode=REGION_MODES[0],
+    region_offset_on=True,
 )
 S = st.session_state
 for _k, _v in DEFAULTS.items():
     S.setdefault(_k, _v)
 
+# --- Design (ergänzt das Farbschema aus .streamlit/config.toml) ---------------
+st.markdown("""
+<style>
+.block-container {padding-top: 3rem; padding-bottom: 2rem; max-width: 1700px;}
+.app-header {background: linear-gradient(135deg, #4a3216 0%, #8b5a2b 55%, #c89b5a 100%);
+  color: #fff; padding: 18px 26px; border-radius: 14px; margin-bottom: 16px;
+  box-shadow: 0 4px 14px rgba(74, 50, 22, .25);}
+.app-header h1 {color: #fff !important; margin: 0 !important; font-size: 1.9rem; padding: 2px 0 !important;
+  line-height: 1.35 !important;}
+.app-header p {margin: 4px 0 0; opacity: .92; font-size: 1rem;}
+div[data-testid="stMetric"] {background: #fff; border: 1px solid #e6dccb; border-radius: 12px;
+  padding: 10px 14px; box-shadow: 0 1px 4px rgba(0, 0, 0, .05);}
+div[data-testid="stMetricValue"] {font-size: 1.3rem;}
+.stTabs [data-baseweb="tab-list"] {gap: 6px; flex-wrap: wrap;}
+.stTabs [data-baseweb="tab"] {background: #f1e8da; border-radius: 10px 10px 0 0; padding: 8px 18px;}
+.stTabs [aria-selected="true"] {background: #8b5a2b !important;}
+.stTabs [aria-selected="true"] p {color: #fff !important; font-weight: 600;}
+section[data-testid="stSidebar"] {background: #f4ede2;}
+div[data-testid="stExpander"] {border-radius: 10px; background: #fff;}
+footer {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
 
 # =============================================================================
 # Datenstrukturen & Hilfsfunktionen
@@ -112,12 +168,20 @@ class Layer:
     diverging: bool = False
     fixed: tuple | None = None
     desc: str = ""
+    key: tuple = ()          # eindeutiger Cache-Schlüssel (Modell + Parameter)
+
+
+def wide(fn, *args, **kwargs):
+    """Element in voller Breite – neue Streamlit-Schreibweise, Rückfall auf die alte."""
+    try:
+        return fn(*args, width="stretch", **kwargs)
+    except TypeError:
+        return fn(*args, use_container_width=True, **kwargs)
 
 
 def file_ext(name):
     n = name.lower()
     return ".laz" if n.endswith(".copc.laz") else os.path.splitext(n)[1]
-
 
 def _is_number(s):
     try:
@@ -126,10 +190,8 @@ def _is_number(s):
     except ValueError:
         return False
 
-
 def _num(v, nd=2):
     return None if v is None or (isinstance(v, float) and math.isnan(v)) else round(float(v), nd)
-
 
 def _crs_str(crs):
     if crs is None:
@@ -145,18 +207,15 @@ def _crs_str(crs):
     except Exception:
         return None
 
-
 def is_geographic(crs):
     try:
         return PYPROJ_OK and bool(crs) and pyproj.CRS.from_user_input(crs).is_geographic
     except Exception:
         return False
 
-
 @st.cache_resource
 def get_transformer(crs):
     return pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-
 
 def to_latlon(x, y, crs):
     if not PYPROJ_OK or not crs:
@@ -169,15 +228,12 @@ def to_latlon(x, y, crs):
     except Exception:
         return None, None
 
-
 def maps_link(lat, lon):
     return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
-
 
 def stride_ds(a, max_dim):
     s = max(1, math.ceil(max(a.shape) / max_dim))
     return a[::s, ::s], s
-
 
 def block_nanmean(z, f):
     h, w = (z.shape[0] // f) * f, (z.shape[1] // f) * f
@@ -185,6 +241,12 @@ def block_nanmean(z, f):
         warnings.simplefilter("ignore", RuntimeWarning)
         return np.nanmean(z[:h, :w].reshape(h // f, f, w // f, f), axis=(1, 3)).astype(np.float32)
 
+def fmt_vol(v):
+    if v >= 1e9:
+        return f"{v / 1e9:.2f} km³"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f} Mio. m³"
+    return f"{v:,.0f} m³".replace(",", ".")
 
 # =============================================================================
 # Import
@@ -193,7 +255,6 @@ ALIASES = {"x": {"x", "east", "easting", "rechtswert", "e"},
            "y": {"y", "north", "northing", "hochwert", "n"},
            "z": {"z", "h", "height", "elevation", "hoehe", "höhe", "alt"},
            "classification": {"classification", "class", "klasse", "cls"}}
-
 
 def load_xyz_text(b):
     """Robuster XYZ/TXT/CSV-Import: Trennzeichen, Kopfzeile, Dezimalkomma – float64!"""
@@ -226,13 +287,11 @@ def load_xyz_text(b):
     out = pd.DataFrame({k: pd.to_numeric(df[v], errors="coerce") for k, v in mapping.items()})
     return out.dropna(subset=["x", "y", "z"])
 
-
 def load_ply(b):
     if not PLY_OK:
         raise ImportError("Für PLY wird 'plyfile' benötigt: pip install plyfile")
     v = PlyData.read(io.BytesIO(b))["vertex"]
     return pd.DataFrame({k: np.asarray(v[k], np.float64) for k in "xyz"})
-
 
 def las_crs(header):
     try:
@@ -245,12 +304,12 @@ def las_crs(header):
     except Exception:
         return None
 
-
-def las_bounds(b):
-    with laspy.open(io.BytesIO(b)) as r:
+def las_bounds(f):
+    """Ausdehnung aus dem Header – liest direkt aus der hochgeladenen Datei (keine Kopie)."""
+    f.seek(0)
+    with laspy.open(f, closefd=False) as r:
         h = r.header
         return float(h.mins[0]), float(h.mins[1]), float(h.maxs[0]), float(h.maxs[1])
-
 
 class GridAcc:
     """Aggregiert Punkte blockweise in ein Raster (Mittelwert oder Minimum), Nord oben."""
@@ -260,7 +319,8 @@ class GridAcc:
         self.note = None
         if (dx // res + 1) * (dy // res + 1) > MAX_PIXELS:
             new = math.ceil(math.sqrt(dx * dy / MAX_PIXELS) * 105) / 100
-            self.note = f"Auflösung automatisch von {res:.2f} m auf {new:.2f} m erhöht (Speicherschutz)."
+            self.note = (f"Auflösung automatisch von {res:.2f} m auf {new:.2f} m erhöht (Speicherschutz). "
+                         "Für feinere Auflösung weniger Kacheln oder einen Ausschnitt laden.")
             res = new
         self.res, self.x0, self.y1, self.use_min = res, x0, y1, use_min
         self.w, self.h = int(dx // res) + 1, int(dy // res) + 1
@@ -288,26 +348,28 @@ class GridAcc:
         ok = self.cnt > 0
         out = np.full(self.h * self.w, np.nan, np.float32)
         out[ok] = self.acc[ok] if self.use_min else self.acc[ok] / self.cnt[ok]
+        self.acc = self.cnt = None            # Speicher sofort freigeben
         return out.reshape(self.h, self.w)
 
-
-def las_add(b, acc, ground_only):
-    """Liest LAS/LAZ/COPC blockweise. Fällt bei fehlender Klassifikation auf alle Punkte zurück."""
+def las_add(f, acc, ground_only):
+    """Liest LAS/LAZ/COPC blockweise direkt aus der Upload-Datei.
+    Fällt bei fehlender Klassifikation auf alle Punkte zurück."""
     for use_filter in ([True, False] if ground_only else [False]):
         used = 0
-        with laspy.open(io.BytesIO(b)) as r:
+        f.seek(0)
+        with laspy.open(f, closefd=False) as r:
             crs = las_crs(r.header)
-            for pts in r.chunk_iterator(2_000_000):
+            for pts in r.chunk_iterator(1_000_000):
                 x, y, z = (np.asarray(v, np.float64) for v in (pts.x, pts.y, pts.z))
                 if use_filter:
                     m = np.asarray(pts.classification) == 2
                     x, y, z = x[m], y[m], z[m]
                 acc.add(x, y, z)
                 used += len(x)
+                del pts, x, y, z
         if used:
             return crs, use_filter != ground_only
     raise ValueError("Die LAS/LAZ-Datei enthält keine Punkte.")
-
 
 def load_geotiff(b):
     if not RASTERIO_OK:
@@ -338,7 +400,6 @@ def load_geotiff(b):
              "Für volle Auflösung einen kleineren Ausschnitt wählen."] if f > 1 else []
     return np.ascontiguousarray(z), float(x_min), float(y_max), float((rx + ry) / 2), crs, notes
 
-
 def load_asc(b):
     lines = b.decode("utf-8", "ignore").splitlines()
     hdr, i = {}, 0
@@ -365,29 +426,35 @@ def load_asc(b):
         notes.append(f"Großes ASC-Raster um Faktor {f} reduziert.")
     return z, float(x_min), float(y_max), cs, None, notes
 
-
 def fill_gaps(z):
     void = ~np.isfinite(z)
     if not void.any():
         return z.astype(np.float32)
     idx = ndimage.distance_transform_edt(void, return_distances=False, return_indices=True)
     filled = z[tuple(idx)].astype(np.float32)
+    del idx
     filled[void] = ndimage.uniform_filter(filled, size=5)[void]
     return filled
 
+def suggest_res(density):
+    """Sinnvolle Rasterweite aus der Punktdichte (≈ 1 Punkt pro Zelle), auf 0,25 m gerundet."""
+    if not density or density <= 0:
+        return None
+    return float(np.clip(math.ceil(1 / math.sqrt(density) * 4) / 4, 0.25, 10.0))
 
-@st.cache_resource(max_entries=2, show_spinner="Lade und rasterisiere Daten …")
+@st.cache_resource(max_entries=1, show_spinner="Lade und rasterisiere Daten …")
 def load_grid(grid_key, _files):
     _, pc, morph = grid_key
-    notes, n_points = [], None
-    named = [(f.name, f.getvalue()) for f in _files]
-    rasters = [(n, b) for n, b in named if file_ext(n) in RASTER_EXT]
-    points = [(n, b) for n, b in named if file_ext(n) in POINT_EXT]
+    notes, n_points, density = [], None, None
+    rasters = [f for f in _files if file_ext(f.name) in RASTER_EXT]
+    points = [f for f in _files if file_ext(f.name) in POINT_EXT]
     if rasters:
-        name, b = rasters[0]
-        if len(named) > 1:
-            notes.append(f"Nur '{name}' wird verwendet – Mosaike sind nur mit Punktwolken möglich.")
-        z, x_min, y_max, res, crs, n = load_asc(b) if file_ext(name) == ".asc" else load_geotiff(b)
+        f = rasters[0]
+        if len(_files) > 1:
+            notes.append(f"Nur '{f.name}' wird verwendet – Mosaike sind nur mit Punktwolken möglich.")
+        b = f.getvalue()
+        z, x_min, y_max, res, crs, n = load_asc(b) if file_ext(f.name) == ".asc" else load_geotiff(b)
+        del b
         notes += n + [f"Auflösung aus Datei: {res:.2f} m (Sidebar-Auflösung gilt nur für Punktwolken)."]
         if is_geographic(crs):
             raise ValueError("Raster liegt in geografischen Koordinaten (Grad). Bitte in ein "
@@ -396,24 +463,27 @@ def load_grid(grid_key, _files):
     else:
         res, agg, ground_only = pc
         parsed, crs = [], None
-        for name, b in points:
-            ext = file_ext(name)
+        for f in points:
+            ext = file_ext(f.name)
             if ext in (".las", ".laz"):
                 if not LASPY_OK:
                     raise ImportError("Für LAS/LAZ wird 'laspy[lazrs]' benötigt.")
-                parsed.append(("las", name, b, las_bounds(b)))
+                parsed.append(["las", f.name, f, las_bounds(f)])
             else:
+                b = f.getvalue()
                 df = load_ply(b) if ext == ".ply" else load_xyz_text(b)
+                del b
                 if ground_only and "classification" in df and (df["classification"] == 2).any():
                     df = df[df["classification"] == 2]
-                    notes.append(f"'{name}': nur Bodenpunkte (Klasse 2) verwendet.")
-                parsed.append(("df", name, df, (df.x.min(), df.y.min(), df.x.max(), df.y.max())))
+                    notes.append(f"'{f.name}': nur Bodenpunkte (Klasse 2) verwendet.")
+                parsed.append(["df", f.name, df, (df.x.min(), df.y.min(), df.x.max(), df.y.max())])
         bx = np.array([p[3] for p in parsed], float)
         acc = GridAcc(bx[:, 0].min(), bx[:, 1].min(), bx[:, 2].max(), bx[:, 3].max(),
                       res, agg.startswith("Minimum"))
         if acc.note:
             notes.append(acc.note)
-        for kind, name, payload, _ in parsed:
+        for p in parsed:
+            kind, name, payload = p[0], p[1], p[2]
             if kind == "las":
                 try:
                     c, fallback = las_add(payload, acc, ground_only)
@@ -428,7 +498,11 @@ def load_grid(grid_key, _files):
             else:
                 acc.add(payload.x.to_numpy(np.float64), payload.y.to_numpy(np.float64),
                         payload.z.to_numpy(np.float64))
-        z, x_min, y_max, res, n_points = acc.result(), acc.x0, acc.y1, acc.res, acc.n
+            p[2] = None                       # Daten der Datei freigeben
+            gc.collect()
+        n_points, x_min, y_max, res = acc.n, acc.x0, acc.y1, acc.res
+        z = acc.result()
+        del acc, parsed
         if len(points) > 1:
             notes.append(f"{len(points)} Punktwolken zu einem Mosaik zusammengesetzt.")
         source = "Punktwolke"
@@ -437,35 +511,37 @@ def load_grid(grid_key, _files):
     void = ~np.isfinite(z)
     if void.all():
         raise ValueError("Keine gültigen Höhenwerte gefunden.")
+    if n_points:
+        covered = int((~void).sum())
+        density = n_points / max(covered * res ** 2, 1e-9)
     zf = fill_gaps(z)
+    del z
     if void.any():
         notes.append(f"{void.mean() * 100:.1f} % der Zellen ohne Daten wurden interpoliert.")
     if morph:
         win = max(3, int(round(morph[0] / res)))
         nonground = (zf - ndimage.grey_opening(zf, size=(win, win))) > morph[1]
         if nonground.any():
-            z2 = zf.copy()
-            z2[nonground] = np.nan
-            zf = fill_gaps(z2)
+            zf[nonground] = np.nan
+            zf = fill_gaps(zf)
             notes.append(f"Vegetationsfilter: {nonground.mean() * 100:.1f} % der Zellen ersetzt.")
+        del nonground
     big_void = ndimage.distance_transform_edt(void) > 2 if void.any() else void
+    gc.collect()
     return dict(z=zf, void=big_void, x_min=float(x_min), y_max=float(y_max), res=float(res),
-                crs=crs, notes=notes, source=source, n_points=n_points)
-
+                crs=crs, notes=notes, source=source, n_points=n_points, density=density)
 
 # =============================================================================
-# Reliefmodelle (Rohwerte in physikalischen Einheiten)
+# Reliefmodelle – einzeln berechnet und zwischengespeichert
 # =============================================================================
 def gradients(z, res):
     d_row, d_col = np.gradient(z, res)
-    return d_col, -d_row  # dz/dx (Ost), dz/dy (Nord)
-
+    return d_col.astype(np.float32), (-d_row).astype(np.float32)  # dz/dx (Ost), dz/dy (Nord)
 
 def hillshade(dzdx, dzdy, az, alt):
     az, alt = np.deg2rad(az), np.deg2rad(alt)
     lx, ly, lz = np.sin(az) * np.cos(alt), np.cos(az) * np.cos(alt), np.sin(alt)
     return np.clip((-dzdx * lx - dzdy * ly + lz) / np.sqrt(dzdx**2 + dzdy**2 + 1), 0, 1).astype(np.float32)
-
 
 def pct_range(a, lo, hi):
     v = stride_ds(a, 1000)[0]
@@ -475,11 +551,9 @@ def pct_range(a, lo, hi):
     p = np.percentile(v, (lo, hi))
     return float(p[0]), float(p[1])
 
-
 def norm01(a, lo=5, hi=95):
     l, h = pct_range(a, lo, hi)
     return np.full_like(a, 0.5) if h <= l else np.clip((a - l) / (h - l), 0, 1).astype(np.float32)
-
 
 def horizon_models(z, res, n_dir, radius_m):
     """Sky-View-Factor, positive & negative Openness per Horizontscan."""
@@ -507,50 +581,119 @@ def horizon_models(z, res, n_dir, radius_m):
     return ((1 - s_sin / n_dir).astype(np.float32), np.degrees(s_pos / n_dir).astype(np.float32),
             np.degrees(s_neg / n_dir).astype(np.float32))
 
+@st.cache_resource(max_entries=1, show_spinner=False)
+def c_grads(gkey, _z, res):
+    return gradients(_z, res)
 
-@st.cache_resource(max_entries=1, show_spinner="Berechne Reliefmodelle …")
-def compute_models(models_key, _z, res, az, alt, sigma_m, svf_on, svf_dirs, svf_radius):
-    z = _z
-    dzdx, dzdy = gradients(z, res)
-    hs = hillshade(dzdx, dzdy, az, alt)
-    mds = np.mean([hillshade(dzdx, dzdy, a, alt) for a in (315, 45, 135, 225)], axis=0).astype(np.float32)
-    slope = np.degrees(np.arctan(np.hypot(dzdx, dzdy))).astype(np.float32)
-    aspect = ((np.degrees(np.arctan2(-dzdx, -dzdy)) + 360) % 360).astype(np.float32)
-    curv = (-ndimage.laplace(z) / res**2).astype(np.float32)
-    smooth = ndimage.gaussian_filter(z, max(1.0, sigma_m / res))
-    lrm = (z - smooth).astype(np.float32)
-    bg_slope = np.degrees(np.arctan(np.hypot(*gradients(smooth, res)))).astype(np.float32)
-    radii = [r for r in (2, 5, 10, 20, 40) if r / res >= 1 and r <= min(z.shape) * res / 4] or [2 * res]
-    msrm = np.mean([z - ndimage.gaussian_filter(z, r / res) for r in radii], axis=0).astype(np.float32)
-    lrm_n = norm01(lrm)
-    comp = np.clip(mds + (lrm_n - 0.5) * 0.3, 0, 1).astype(np.float32)
-    if svf_on:
-        svf, pos, neg = horizon_models(z, res, svf_dirs, svf_radius)
-        parts = [hs, 1 - np.clip(slope / 50, 0, 1), np.clip((svf - 0.65) / 0.35, 0, 1),
-                 np.clip((pos - 60) / 35, 0, 1)]
-    else:
-        parts = [hs, 1 - np.clip(slope / 50, 0, 1), lrm_n]
-    # Graustufen-Modelle ohne feste Skala -> werden über den Kontrastregler gestreckt
-    L = {
-        "Final Composite (Fusion)": Layer(comp, "gray", desc="MDS + Restrelief (Ursprungsversion)."),
-        "VAT-ähnliche Fusion": Layer(np.mean(parts, axis=0).astype(np.float32), "gray",
-                                     desc="Hillshade + Slope + " + ("SVF + Openness" if svf_on else "LRM")
-                                     + " – angelehnt an VAT (Kokalj & Somrak)."),
-        "Hillshade": Layer(hs, "gray", desc=f"Azimut {az}°, Sonnenhöhe {alt}°."),
-        "MDS Composite": Layer(mds, "gray", desc="Mittel aus 4 Lichtrichtungen."),
-        "Restrelief (LRM)": Layer(lrm, "RdBu_r", "m", True, desc=f"Höhe minus Glättung (σ={sigma_m:.0f} m). Rot = erhaben."),
-        "Multi-Skalen-Relief": Layer(msrm, "RdBu_r", "m", True, desc="Mittleres Restrelief über 2–40 m."),
-        "Hangneigung (Slope)": Layer(slope, "plasma", "°", desc="Neigung in Grad."),
-        "Krümmung (Curvature)": Layer(curv, "RdYlGn", "1/m", True, desc="+ konvex (Kuppe), − konkav (Mulde)."),
-        "Hangausrichtung (Aspect)": Layer(aspect, "twilight", "°", fixed=(0, 360), desc="Exposition ab Nord."),
-    }
-    if svf_on:
-        L["Sky-View-Factor (SVF)"] = Layer(svf, "gray", "", desc="Anteil sichtbarer Himmel (0–1).")
-        L["Positive Openness"] = Layer(pos, "gray", "°", desc="Betont Kuppen und Wälle.")
-        L["Negative Openness"] = Layer(neg, "gray_r", "°", desc="Betont Gräben und Senken.")
-    L["DTM (Höhe)"] = Layer(z, "terrain", "m", desc="Geländehöhe (gefüllt/gefiltert).")
-    return L, {"lrm": lrm, "bg_slope": bg_slope}
+@st.cache_resource(max_entries=1, show_spinner=False)
+def c_smooth(gkey, _z, res, sigma_m):
+    return ndimage.gaussian_filter(_z, max(1.0, sigma_m / res)).astype(np.float32)
 
+@st.cache_resource(max_entries=1, show_spinner=False)
+def c_bg_slope(gkey, _z, res, sigma_m):
+    gx, gy = gradients(c_smooth(gkey, _z, res, sigma_m), res)
+    return np.degrees(np.arctan(np.hypot(gx, gy))).astype(np.float32)
+
+@st.cache_resource(max_entries=1, show_spinner="Berechne Sky-View-Factor & Openness …")
+def c_horizon(gkey, _z, res, dirs, radius):
+    return horizon_models(_z, res, dirs, radius)
+
+def layer_params(name):
+    """Nur die Parameter, von denen ein Modell wirklich abhängt (= sein Cache-Schlüssel)."""
+    az, alt, sg = int(S.hs_azimuth), int(S.hs_altitude), float(S.lrm_sigma_m)
+    hz = (int(S.svf_dirs), int(S.svf_radius_m))
+    return {"Hillshade": (az, alt), "MDS Composite": (alt,), "Restrelief (LRM)": (sg,),
+            "Final Composite (Fusion)": (alt, sg),
+            "VAT-ähnliche Fusion": (az, alt, sg, bool(S.enable_svf)) + (hz if S.enable_svf else ()),
+            "Sky-View-Factor (SVF)": hz, "Positive Openness": hz, "Negative Openness": hz}.get(name, ())
+
+@st.cache_resource(max_entries=20, show_spinner="Berechne Reliefmodell …")
+def build_layer(lkey, _lz):
+    gkey, name, p = lkey
+    z, res = _lz.z, _lz.res
+    k = dict(key=lkey)
+    if name == DTM_NAME:
+        return Layer(z, "terrain", "m", desc="Geländehöhe (gefüllt/gefiltert).", **k)
+    if name in SVF_NAMES:
+        svf, pos, neg = c_horizon(gkey, z, res, *p)
+        if name == SVF_NAMES[0]:
+            return Layer(svf, "gray", desc="Anteil sichtbarer Himmel (0–1). Gut unter Wald und in Hanglagen.", **k)
+        if name == SVF_NAMES[1]:
+            return Layer(pos, "gray", "°", desc="Betont Kuppen und Wälle.", **k)
+        return Layer(neg, "gray_r", "°", desc="Betont Gräben und Senken.", **k)
+    if name == "Restrelief (LRM)":
+        lrm = (z - c_smooth(gkey, z, res, p[0])).astype(np.float32)
+        return Layer(lrm, "RdBu_r", "m", True, desc=f"Höhe minus Glättung (σ={p[0]:.0f} m). Rot = erhaben.", **k)
+    if name == "Multi-Skalen-Relief":
+        radii = [r for r in (2, 5, 10, 20, 40) if r / res >= 1 and r <= min(z.shape) * res / 4] or [2 * res]
+        acc = np.zeros(z.shape, np.float32)
+        for r in radii:                                   # schrittweise statt 5 Kopien gleichzeitig
+            acc += z - ndimage.gaussian_filter(z, r / res)
+        acc /= len(radii)
+        return Layer(acc, "RdBu_r", "m", True, desc="Mittleres Restrelief über 2–40 m.", **k)
+    if name == "Krümmung (Curvature)":
+        curv = (-ndimage.laplace(z) / res**2).astype(np.float32)
+        return Layer(curv, "RdYlGn", "1/m", True, desc="+ konvex (Kuppe), − konkav (Mulde).", **k)
+    if name == "Final Composite (Fusion)":
+        mds = _lz["MDS Composite"].raw
+        lrm_n = norm01(_lz["Restrelief (LRM)"].raw)
+        comp = np.clip(mds + (lrm_n - 0.5) * 0.3, 0, 1).astype(np.float32)
+        return Layer(comp, "gray", desc="MDS + Restrelief (Ursprungsversion). Guter Einstieg.", **k)
+    if name == "VAT-ähnliche Fusion":
+        acc = _lz["Hillshade"].raw.copy()
+        acc += 1 - np.clip(_lz["Hangneigung (Slope)"].raw / 50, 0, 1)
+        n = 2
+        if p[3]:
+            svf, pos, _ = c_horizon(gkey, z, res, p[4], p[5])
+            acc += np.clip((svf - 0.65) / 0.35, 0, 1)
+            acc += np.clip((pos - 60) / 35, 0, 1)
+            n += 2
+        else:
+            acc += norm01(_lz["Restrelief (LRM)"].raw)
+            n += 1
+        acc /= n
+        return Layer(acc.astype(np.float32), "gray",
+                     desc="Hillshade + Slope + " + ("SVF + Openness" if p[3] else "LRM")
+                     + " – angelehnt an VAT (Kokalj & Somrak).", **k)
+    gx, gy = c_grads(gkey, z, res)
+    if name == "Hillshade":
+        return Layer(hillshade(gx, gy, p[0], p[1]), "gray", desc=f"Azimut {p[0]}°, Sonnenhöhe {p[1]}°.", **k)
+    if name == "MDS Composite":
+        acc = np.zeros(z.shape, np.float32)
+        for a in (315, 45, 135, 225):
+            acc += hillshade(gx, gy, a, p[0])
+        return Layer(acc / 4, "gray", desc="Mittel aus 4 Lichtrichtungen.", **k)
+    if name == "Hangneigung (Slope)":
+        return Layer(np.degrees(np.arctan(np.hypot(gx, gy))).astype(np.float32), "plasma", "°",
+                     desc="Neigung in Grad.", **k)
+    if name == "Hangausrichtung (Aspect)":
+        asp = ((np.degrees(np.arctan2(-gx, -gy)) + 360) % 360).astype(np.float32)
+        return Layer(asp, "twilight", "°", fixed=(0, 360), desc="Exposition ab Nord.", **k)
+    raise KeyError(name)
+
+class LazyLayers:
+    """Verhält sich wie ein Dict der Reliefmodelle – berechnet jedes Modell erst bei Bedarf."""
+
+    def __init__(self, gkey, z, res):
+        self.gkey, self.z, self.res = gkey, z, res
+
+    @property
+    def names(self):
+        return BASE_NAMES + (SVF_NAMES if S.enable_svf else []) + [DTM_NAME]
+
+    def __iter__(self):
+        return iter(self.names)
+
+    def __contains__(self, name):
+        return name in self.names
+
+    def key(self, name):
+        return (self.gkey, name, layer_params(name))
+
+    def __getitem__(self, name):
+        if name not in self.names:
+            raise KeyError(name)
+        return build_layer(self.key(name), self)
 
 # =============================================================================
 # Darstellung
@@ -562,7 +705,6 @@ def plotly_cs(name):
         return [[0, "white"], [1, "black"]]
     return {"terrain": "earth"}.get(name, name)
 
-
 def vrange(L, stretch):
     if L.fixed:
         return L.fixed
@@ -572,7 +714,6 @@ def vrange(L, stretch):
         return -m, m
     return (lo, hi) if hi > lo else (lo, lo + 1e-6)
 
-
 def display_array(L, grid, max_dim, hide):
     arr, s = stride_ds(L.raw, max_dim)
     arr = arr.astype(np.float32, copy=True)
@@ -580,45 +721,73 @@ def display_array(L, grid, max_dim, hide):
         arr[grid.void[::s, ::s]] = np.nan
     return arr, s
 
-
 def ds_axes(grid, shape, s):
     return (grid.x_min + (np.arange(shape[1]) * s + 0.5) * grid.res,
             grid.y_max - (np.arange(shape[0]) * s + 0.5) * grid.res)
 
-
 def to_rgba(arr, cmap, vmin, vmax):
     n = (arr - vmin) / (vmax - vmin) if vmax > vmin else np.zeros_like(arr)
     return matplotlib.colormaps[cmap](np.ma.masked_invalid(np.clip(n, 0, 1)), bytes=True)
-
 
 def png_bytes(rgba):
     buf = io.BytesIO()
     plt.imsave(buf, rgba, format="png")
     return buf.getvalue()
 
+def data_uri(png):
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+def composite_rgba(base, top):
+    """Legt 'top' (RGBA, mit Transparenz) über 'base' (RGBA) – Ergebnis ist ein deckendes Bild."""
+    b = base.astype(np.float32) / 255.0
+    t = top.astype(np.float32) / 255.0
+    ba, ta = b[..., 3:4], t[..., 3:4]
+    b_rgb = b[..., :3] * ba + (1.0 - ba)          # transparente Stellen -> weiß
+    rgb = t[..., :3] * ta + b_rgb * (1.0 - ta)
+    out = np.concatenate([rgb, np.ones_like(ta)], axis=-1)
+    return (out * 255.0 + 0.5).astype(np.uint8)
 
 PLOTLY_CONFIG = {"scrollZoom": True, "displaylogo": False,
                  "toImageButtonOptions": {"format": "png", "scale": 2}}
 
-
 def show_plot(fig, container=None):
     """Plotly-Diagramm in voller Breite, Mausrad-Zoom aktiv."""
-    (container or st).plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-
+    wide((container or st).plotly_chart, fig, config=PLOTLY_CONFIG)
 
 def show_image(img, caption=None):
-    """Bild in voller Spaltenbreite (kompatibel mit älteren und neueren Streamlit-Versionen)."""
+    """Bild in voller Spaltenbreite (neue und ältere Streamlit-Versionen)."""
     try:
-        st.image(img, caption=caption, use_container_width=True)
-    except TypeError:
-        st.image(img, caption=caption, use_column_width=True)
+        st.image(img, caption=caption, width="stretch")
+    except Exception:
+        try:
+            st.image(img, caption=caption, use_container_width=True)
+        except TypeError:
+            st.image(img, caption=caption, use_column_width=True)
 
-
-@st.cache_resource(max_entries=32)
+@st.cache_resource(max_entries=24)
 def layer_png(key, _L, _grid, stretch, hide, max_dim):
     arr, _ = display_array(_L, _grid, max_dim, hide)
     return png_bytes(to_rgba(arr, _L.cmap, *vrange(_L, stretch)))
 
+def lpng(L, max_dim):
+    """PNG eines Modells – Schlüssel = Modell + Parameter (keine veralteten Bilder)."""
+    return layer_png(L.key, L, grid, tuple(S.stretch), bool(S.hide_voids), int(max_dim))
+
+def img_extent(g):
+    """Platziert ein Bild passgenau in Weltkoordinaten."""
+    return dict(xref="x", yref="y", x=g.x_min, y=g.y_max, sizex=g.x_max - g.x_min,
+                sizey=g.y_max - g.y_min, sizing="stretch", layer="below")
+
+def apply_xy_layout(fig, title, height):
+    fig.update_layout(
+        height=int(height), title=title, margin=dict(l=10, r=10, t=40, b=10),
+        dragmode="pan", uirevision=str(hash(grid_key)), plot_bgcolor="white",
+        xaxis=dict(title="X (m)", range=[grid.x_min, grid.x_max], constrain="domain",
+                   showgrid=False, zeroline=False),
+        yaxis=dict(title="Y (m)", range=[grid.y_min, grid.y_max], scaleanchor="x", scaleratio=1,
+                   showgrid=False, zeroline=False),
+        legend=dict(orientation="h", y=-0.08))
+    return fig
 
 def feature_traces(feats, grid):
     traces = []
@@ -647,51 +816,27 @@ def feature_traces(feats, grid):
                                  hovertemplate="%{text}<extra></extra>"))
     return traces
 
-
 def layer_figure(name, L, grid, max_dim=None, feats=None, height=None, overlay=None, opacity=0.5):
     """Scharfes, zoombares Bild: PNG als Hintergrund + unsichtbares Raster für Messwerte."""
     max_dim = int(max_dim or S.view_px)
     height = int(height or S.view_height)
     fig = go.Figure()
-
-    # 1) Hochaufgelöste Bilder (Basis + optional Überlagerung) passgenau in Weltkoordinaten
-    extent = dict(xref="x", yref="y", x=grid.x_min, y=grid.y_max,
-                  sizex=grid.x_max - grid.x_min, sizey=grid.y_max - grid.y_min,
-                  sizing="stretch", layer="below")
     stack = [(L, 1.0)] + ([(overlay, opacity)] if overlay is not None else [])
     for layer, op in stack:
-        png = layer_png((models_key, id(layer)), layer, grid, tuple(S.stretch), S.hide_voids, max_dim)
-        fig.add_layout_image(source="data:image/png;base64," + base64.b64encode(png).decode(),
-                             opacity=op, **extent)
-
-    # 2) Unsichtbares, grobes Raster nur für die Messwert-Anzeige beim Überfahren
+        fig.add_layout_image(source=data_uri(lpng(layer, max_dim)), opacity=op, **img_extent(grid))
     hv, s = display_array(L, grid, 400, S.hide_voids)
     xs, ys = ds_axes(grid, hv.shape, s)
     u = f" {L.unit}" if L.unit else ""
     fig.add_trace(go.Heatmap(z=hv, x=xs, y=ys, opacity=0, showscale=False, showlegend=False,
                              hovertemplate=f"X %{{x:.1f}} · Y %{{y:.1f}}<br>≈ %{{z:.3f}}{u}<extra></extra>"))
-
-    # 3) Farbskala (nur bei Modellen mit Einheit)
     if L.unit:
         vmin, vmax = vrange(L, S.stretch)
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
                                  marker=dict(colorscale=plotly_cs(L.cmap), cmin=vmin, cmax=vmax,
                                              color=[vmin], showscale=True, colorbar=dict(title=L.unit))))
-
-    # 4) Erkannte Features
     for t in feature_traces(feats or [], grid):
         fig.add_trace(t)
-
-    fig.update_layout(
-        height=height, title=name, margin=dict(l=10, r=10, t=40, b=10),
-        dragmode="pan", uirevision=str(hash(grid_key)), plot_bgcolor="white",
-        xaxis=dict(title="X (m)", range=[grid.x_min, grid.x_max], constrain="domain",
-                   showgrid=False, zeroline=False),
-        yaxis=dict(title="Y (m)", range=[grid.y_min, grid.y_max], scaleanchor="x", scaleratio=1,
-                   showgrid=False, zeroline=False),
-        legend=dict(orientation="h", y=-0.08))
-    return fig
-
+    return apply_xy_layout(fig, name, height)
 
 # =============================================================================
 # Feature-Erkennung (heuristisch, keine archäologische Verifikation)
@@ -703,7 +848,6 @@ def classify(typ, bg, size, height=None):
     if typ == "Linie" and size and size >= 50:
         score += 1
     return "auffällig" if score >= 3 else "möglich" if score == 2 else "unklar"
-
 
 def detect_features(lrm, bg_slope, grid, p):
     res, (H, W), feats = grid.res, lrm.shape, []
@@ -747,7 +891,7 @@ def detect_features(lrm, bg_slope, grid, p):
                 r_lo, r_hi = max(0, int(r) - rr), min(H, int(r) + rr + 1)
                 c_lo, c_hi = max(0, int(c) - rr), min(W, int(c) + rr + 1)
                 yy, xx = np.ogrid[r_lo:r_hi, c_lo:c_hi]
-                vals = sign * lrm[r_lo:r_hi, c_lo:c_hi][(yy - r) ** 2 + (xx - c) ** 2 <= rad**2]
+                vals = sign * lrm[r_lo:r_hi, c_lo:c_hi][(yy - r) ** 2 + (xx - c) ** 2 <= rad ** 2]
                 if vals.size and vals.max() >= p["blob_min_h"]:
                     cand.append((float(vals.max()), r, c, rad, float(np.clip(vals, 0, None).sum() * res**2)))
             for height, r, c, rad, vol in sorted(cand, reverse=True)[:400]:
@@ -769,7 +913,6 @@ def detect_features(lrm, bg_slope, grid, p):
         ft["ID"] = i
     return feats
 
-
 def features_df(feats, crs):
     if not feats:
         return pd.DataFrame()
@@ -781,6 +924,314 @@ def features_df(feats, crs):
     first = ["ID", "Typ", "Einstufung", "Größe_m", "Höhe_m", "Volumen_m3", "Hang_bg_deg", "X", "Y"]
     return df[first + [c for c in df.columns if c not in first]]
 
+# =============================================================================
+# Flutungs-Simulation (Badewannen-Modell, keine Strömungssimulation)
+# =============================================================================
+def flood_wet(z, level, mode, seed_rc=None):
+    """Maske der überfluteten Zellen für einen Wasserstand."""
+    with np.errstate(invalid="ignore"):
+        below = z < level
+    if mode == FLOOD_MODES[0] or not below.any():
+        return below
+    lab, _ = ndimage.label(below)
+    if mode == FLOOD_MODES[1]:
+        ids = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    else:
+        r, c = seed_rc if seed_rc is not None else (-1, -1)
+        ok = 0 <= r < z.shape[0] and 0 <= c < z.shape[1]
+        ids = np.array([lab[r, c]]) if ok else np.array([0])
+    ids = ids[ids > 0]
+    return np.isin(lab, ids) if ids.size else np.zeros_like(below)
+
+@st.cache_resource(max_entries=2, show_spinner="Berechne Überflutung …")
+def compute_flood(flood_key, _z, level, mode, seed_rc):
+    wet = flood_wet(_z, level, mode, seed_rc)
+    depth = np.where(wet, level - _z, 0).astype(np.float32)
+    return wet, depth
+
+def _water_rgba(w, d, alpha, dref=None):
+    """Wasser als RGBA: hellblau (flach) bis dunkelblau (tief), trockene Zellen transparent."""
+    if dref is None:
+        dref = float(np.percentile(d[w], 95)) if w.any() else 1.0
+    t = np.clip(d / max(dref, 1e-3), 0, 1)
+    rgba = WATER_CMAP(t, bytes=True)
+    rgba[..., 3] = np.where(w, int(round(255 * alpha)), 0).astype(np.uint8)
+    return rgba
+
+def _water_png_raw(w, d, alpha):
+    return png_bytes(_water_rgba(w, d, alpha))
+
+@st.cache_resource(max_entries=6)
+def water_png(key, _wet, _depth, max_dim, alpha):
+    """Nur Wasser (transparent) – für die Karte."""
+    w, s = stride_ds(_wet, max_dim)
+    return _water_png_raw(w, _depth[::s, ::s], alpha)
+
+@st.cache_resource(max_entries=6)
+def flood_png(key, _L, _grid, _wet, _depth, stretch, hide, max_dim, alpha):
+    """Relief + Wasser zu EINEM deckenden Bild verschmolzen."""
+    base_arr, s = display_array(_L, _grid, max_dim, hide)
+    base_rgba = to_rgba(base_arr, _L.cmap, *vrange(_L, stretch))
+    water = _water_rgba(_wet[::s, ::s], _depth[::s, ::s], alpha)
+    return png_bytes(composite_rgba(base_rgba, water))
+
+@st.cache_resource(max_entries=2)
+def shore_lines(flood_key, _wet, _grid, max_dim=1200):
+    """Uferlinien als Liste von (x, y)-Arrays in Weltkoordinaten."""
+    if not SKIMAGE_OK or not _wet.any() or _wet.all():
+        return []
+    w, s = stride_ds(_wet, max_dim)
+    lines = []
+    for c in sorted(find_contours(w.astype(np.float32), 0.5), key=len, reverse=True)[:400]:
+        if len(c) < 6:
+            continue
+        x, y = _grid.pixel_to_world(c[:, 0] * s, c[:, 1] * s)
+        lines.append((x, y))
+    return lines
+
+def shore_trace(lines):
+    lx, ly = [], []
+    for x, y in lines:
+        lx += list(x) + [None]
+        ly += list(y) + [None]
+    return go.Scatter(x=lx, y=ly, mode="lines", line=dict(color="#ffd400", width=1.6),
+                      name="Uferlinie", hoverinfo="skip")
+
+def flood_figure(title, base_name, wet, depth, lines, show_shore, height):
+    fig = go.Figure()
+    L = layers[base_name]
+    png = flood_png((L.key, flood_key), L, grid, wet, depth,
+                    tuple(S.stretch), bool(S.hide_voids), int(S.view_px), float(S.water_opacity))
+    fig.add_layout_image(source=data_uri(png), opacity=1.0, **img_extent(grid))
+    hz, s = stride_ds(grid.z, 300)
+    hw, hd = wet[::s, ::s], depth[::s, ::s]
+    txt = np.where(hw, np.char.mod("Wassertiefe %.2f m", hd), "trocken")
+    xs, ys = ds_axes(grid, hz.shape, s)
+    fig.add_trace(go.Heatmap(z=hz, x=xs, y=ys, text=txt.tolist(), opacity=0, showscale=False,
+                             showlegend=False,
+                             hovertemplate="X %{x:.1f} · Y %{y:.1f}<br>Höhe %{z:.2f} m<br>%{text}<extra></extra>"))
+    if show_shore and lines:
+        fig.add_trace(shore_trace(lines))
+    return apply_xy_layout(fig, title, height)
+
+@st.cache_resource(max_entries=1)
+def hypsometry(key, _z, res, n=200):
+    """Flutkurve (Badewanne): Fläche und Volumen in Abhängigkeit vom Wasserstand."""
+    zs = np.sort(_z.ravel()).astype(np.float64)
+    cums = np.concatenate([[0.0], np.cumsum(zs)])
+    levels = np.linspace(zs[0], zs[-1], n)
+    cnt = np.searchsorted(zs, levels, side="left")
+    return pd.DataFrame({"wasserstand_m": levels, "flaeche_ha": cnt * res**2 / 1e4,
+                         "anteil_prozent": cnt / zs.size * 100,
+                         "volumen_m3": (levels * cnt - cums[cnt]) * res**2})
+
+@st.cache_resource(max_entries=1, show_spinner="Suche Höhen mit gehäuften Geländekanten …")
+def terrace_signal(key, _z, res, bin_m):
+    """Relative Häufigkeit von Hangknicken und Ebenen je Höhenstufe (1 = Durchschnitt)."""
+    zs = ndimage.gaussian_filter(_z, max(1.0, 2.0 / res))
+    dzdx, dzdy = gradients(zs, res)
+    slope = np.degrees(np.arctan(np.hypot(dzdx, dzdy)))
+    curv = np.abs(ndimage.laplace(zs)) / res**2
+    thr = np.percentile(stride_ds(curv, 1000)[0], 95)
+    edges = (curv > thr) & (slope > 1.0)
+    flat = slope < 2.0
+    zmin_, zmax_ = float(_z.min()), float(_z.max())
+    bin_m = max(bin_m, (zmax_ - zmin_) / 2000)
+    bins = np.arange(math.floor(zmin_ / bin_m) * bin_m, zmax_ + bin_m, bin_m)
+    if len(bins) < 3:
+        bins = np.linspace(zmin_, zmax_ + 1e-6, 3)
+    n_all = np.histogram(_z, bins)[0].astype(float)
+    n_e = np.histogram(_z[edges], bins)[0]
+    n_f = np.histogram(_z[flat], bins)[0]
+    valid = n_all >= max(30, 0.0005 * _z.size)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel_e = (n_e / n_all) / max(edges.mean(), 1e-9)
+        rel_f = (n_f / n_all) / max(flat.mean(), 1e-9)
+    rel_e[~valid] = np.nan
+    rel_f[~valid] = np.nan
+    return pd.DataFrame({"hoehe_m": (bins[:-1] + bins[1:]) / 2, "kantendichte": rel_e,
+                         "ebenen_anteil": rel_f, "pixel": n_all})
+
+def lines_geojson(lines, crs, wgs84, props):
+    out = []
+    for x, y in lines:
+        if wgs84:
+            lat, lon = to_latlon(np.asarray(x), np.asarray(y), crs)
+            if lat is None:
+                continue
+            x, y = lon, lat
+        out.append({"type": "Feature", "properties": props,
+                    "geometry": {"type": "LineString",
+                                 "coordinates": [[float(a), float(b)] for a, b in zip(x, y)]}})
+    fc = {"type": "FeatureCollection", "features": out}
+    if not wgs84 and crs and crs.startswith("EPSG:"):
+        fc["crs"] = {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{crs[5:]}"}}
+    return json.dumps(fc, ensure_ascii=False).encode("utf-8")
+
+# --- Animation (speichert nur PNGs, keine Rohbilder) -------------------------------
+def flood_frames(base_name, lo, hi, steps, mode, seed_rc, alpha, max_dim=600):
+    """Liste von (Wasserstand, PNG) – Relief und Wasser bereits verschmolzen."""
+    L = layers[base_name]
+    base_arr, s = display_array(L, grid, max_dim, S.hide_voids)
+    base_rgba = to_rgba(base_arr, L.cmap, *vrange(L, S.stretch))
+    zs = grid.z[::s, ::s]
+    seed_s = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
+    dref = max(hi - lo, 0.5)
+    out = []
+    for lv in np.linspace(lo, hi, steps):
+        w = flood_wet(zs, lv, mode, seed_s)
+        d = np.where(w, lv - zs, 0).astype(np.float32)
+        out.append((float(lv), png_bytes(composite_rgba(base_rgba, _water_rgba(w, d, alpha, dref)))))
+    return out
+
+def flood_anim_figure(frames, duration_ms):
+    """Plotly-Animation mit Play/Pause und Schieberegler UNTER dem Bild."""
+    ext = img_extent(grid)
+    imgs = [dict(source=data_uri(png), opacity=1.0, **ext) for _, png in frames]
+    fr = [go.Frame(name=f"{lv:.3f}", layout=dict(images=[im], title=dict(text=f"Wasserstand {lv:.2f} m")))
+          for (lv, _), im in zip(frames, imgs)]
+    fig = go.Figure(data=[go.Scatter(x=[grid.x_min, grid.x_max], y=[grid.y_min, grid.y_max],
+                                     mode="markers", opacity=0, hoverinfo="skip", showlegend=False)],
+                    frames=fr)
+    apply_xy_layout(fig, f"Wasserstand {frames[0][0]:.2f} m", S.view_height)
+    play = dict(label="▶ Abspielen", method="animate",
+                args=[None, dict(frame=dict(duration=int(duration_ms), redraw=True), fromcurrent=True,
+                                 transition=dict(duration=0), mode="immediate")])
+    pause = dict(label="⏸ Pause", method="animate",
+                 args=[[None], dict(frame=dict(duration=0, redraw=False), transition=dict(duration=0),
+                                    mode="immediate")])
+    fig.update_layout(
+        images=[imgs[0]],
+        margin=dict(l=10, r=10, t=50, b=140),
+        xaxis_title=None,
+        updatemenus=[dict(type="buttons", direction="left", showactive=False,
+                          x=0.0, xanchor="left", y=-0.03, yanchor="top",
+                          pad=dict(r=10, t=10), buttons=[play, pause])],
+        sliders=[dict(active=0, x=0.25, len=0.75, xanchor="left", y=-0.03, yanchor="top",
+                      pad=dict(t=10, b=10),
+                      currentvalue=dict(prefix="Wasserstand: ", suffix=" m", visible=True),
+                      steps=[dict(method="animate", label=f"{lv:.1f}",
+                                  args=[[f"{lv:.3f}"], dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                                                            transition=dict(duration=0))])
+                             for lv, _ in frames])])
+    return fig
+
+def _gif_font(size):
+    try:
+        return ImageFont.truetype(fm.findfont("DejaVu Sans"), size)
+    except Exception:
+        return ImageFont.load_default()
+
+def frames_to_gif(frames, duration_ms):
+    """Animiertes GIF aus den Animationsbildern (mit eingeblendetem Wasserstand)."""
+    pil_frames, font = [], None
+    for lv, png in frames:
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        if font is None:
+            font = _gif_font(max(14, img.width // 30))
+        draw = ImageDraw.Draw(img)
+        txt = f"Wasserstand {lv:.2f} m"
+        bx = draw.textbbox((0, 0), txt, font=font)
+        pad = 8
+        draw.rectangle([10, 10, 10 + bx[2] - bx[0] + 2 * pad, 10 + bx[3] - bx[1] + 2 * pad], fill=(40, 40, 40))
+        draw.text((10 + pad - bx[0], 10 + pad - bx[1]), txt, fill=(255, 255, 255), font=font)
+        pil_frames.append(img.quantize(colors=255))
+    durations = [int(duration_ms)] * (len(pil_frames) - 1) + [int(duration_ms) * 4]
+    buf = io.BytesIO()
+    pil_frames[0].save(buf, format="GIF", save_all=True, append_images=pil_frames[1:],
+                       duration=durations, loop=0)
+    return buf.getvalue()
+
+# =============================================================================
+# Regionales Höhenmodell (AWS Terrain Tiles, Terrarium-Format) für die Karte
+# =============================================================================
+def lonlat_to_tile(lon, lat, z):
+    n = 2.0 ** z
+    lon = np.asarray(lon, float)
+    lat = np.clip(np.asarray(lat, float), -85.0, 85.0)
+    x = (lon + 180.0) / 360.0 * n
+    y = (1.0 - np.arcsinh(np.tan(np.radians(lat))) / np.pi) / 2.0 * n
+    return x, y
+
+def tile_to_lonlat(x, y, z):
+    n = 2.0 ** z
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    return lon, lat
+
+@st.cache_data(show_spinner=False, max_entries=200)
+def fetch_terrarium(z, x, y):
+    r = requests.get(TERRARIUM_URL.format(z=z, x=x, y=y), timeout=20)
+    r.raise_for_status()
+    a = np.asarray(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.float32)
+    return (a[..., 0] * 256.0 + a[..., 1] + a[..., 2] / 256.0 - 32768.0).astype(np.float32)
+
+def _terrarium_or_nan(z, x, y):
+    """Fehlende Kachel → NaN statt Absturz der ganzen Regionalflutung."""
+    try:
+        return fetch_terrarium(z, x % (2 ** z), y), False
+    except Exception:
+        return np.full((256, 256), np.nan, np.float32), True
+
+@st.cache_data(show_spinner="Lade regionales Höhenmodell …", max_entries=4)
+def regional_dem(lat, lon, radius_km, max_tiles=36):
+    dlat = radius_km / 111.32
+    dlon = radius_km / (111.32 * max(math.cos(math.radians(lat)), 0.05))
+    for z in range(13, 4, -1):
+        x0, y0 = lonlat_to_tile(lon - dlon, lat + dlat, z)
+        x1, y1 = lonlat_to_tile(lon + dlon, lat - dlat, z)
+        tx0, ty0 = int(math.floor(float(x0))), int(math.floor(float(y0)))
+        tx1, ty1 = int(math.floor(float(x1))), int(math.floor(float(y1)))
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= max_tiles:
+            break
+    rows, missing = [], 0
+    for ty in range(ty0, ty1 + 1):
+        row = []
+        for tx in range(tx0, tx1 + 1):
+            t, miss = _terrarium_or_nan(z, tx, ty)
+            missing += miss
+            row.append(t)
+        rows.append(np.hstack(row))
+    dem = np.vstack(rows)
+    if not np.isfinite(dem).any():
+        raise RuntimeError("Keine Höhenkacheln erreichbar (Netzwerk oder Dienst nicht verfügbar).")
+    lon_w, lat_n = tile_to_lonlat(tx0, ty0, z)
+    lon_e, lat_s = tile_to_lonlat(tx1 + 1, ty1 + 1, z)
+    res_m = 156543.03 * math.cos(math.radians(lat)) / 2 ** z
+    meta = dict(z=z, tx0=tx0, ty0=ty0, bounds=(lon_w, lat_n, lon_e, lat_s), res_m=res_m, missing=missing)
+    return dem, meta
+
+def dem_rowcol(meta, lon, lat):
+    px, py = lonlat_to_tile(lon, lat, meta["z"])
+    return (py - meta["ty0"]) * 256 - 0.5, (px - meta["tx0"]) * 256 - 0.5
+
+@st.cache_resource(max_entries=2)
+def regional_offset(key, _grid, crs, lat, lon, radius_km):
+    """Median-Höhendifferenz LiDAR-Kachel minus Regionalmodell (im Bereich der Kachel)."""
+    dem, meta = regional_dem(lat, lon, radius_km)
+    zs, s = stride_ds(_grid.z, 40)
+    xs, ys = ds_axes(_grid, zs.shape, s)
+    X, Y = np.meshgrid(xs, ys)
+    la, lo = to_latlon(X.ravel(), Y.ravel(), crs)
+    if la is None:
+        return 0.0
+    r, c = dem_rowcol(meta, lo, la)
+    d = ndimage.map_coordinates(dem, [r, c], order=1, mode="nearest")
+    diff = zs.ravel() - d
+    return float(np.nanmedian(diff)) if np.isfinite(diff).any() else 0.0
+
+@st.cache_data(show_spinner="Berechne regionale Überflutung …", max_entries=4)
+def regional_water(lat, lon, radius_km, level, offset, mode_idx, seed_ll):
+    dem, meta = regional_dem(lat, lon, radius_km)
+    zz = dem + offset
+    seed = None
+    if mode_idx == 2 and seed_ll:
+        r, c = dem_rowcol(meta, seed_ll[0], seed_ll[1])
+        seed = (int(round(float(r))), int(round(float(c))))
+    wet = flood_wet(zz, level, FLOOD_MODES[mode_idx], seed)
+    depth = np.where(wet, level - zz, 0).astype(np.float32)
+    area_km2 = float(wet.sum()) * meta["res_m"] ** 2 / 1e6
+    return _water_png_raw(wet, depth, 1.0), meta["bounds"], area_km2, meta["res_m"], meta["missing"]
 
 # =============================================================================
 # Export
@@ -793,7 +1244,6 @@ def geotiff_bytes(arr, grid, crs):
                       transform=from_origin(grid.x_min, grid.y_max, grid.res, grid.res)) as dst:
             dst.write(data, 1)
         return mem.read()
-
 
 def features_geojson(feats, grid, crs, wgs84):
     out = []
@@ -817,7 +1267,6 @@ def features_geojson(feats, grid, crs, wgs84):
         fc["crs"] = {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{crs[5:]}"}}
     return json.dumps(fc, ensure_ascii=False).encode("utf-8")
 
-
 def lazy_download(label, spec, make, file_name, mime):
     """Erzeugt teure Exporte erst auf Knopfdruck und merkt sie sich."""
     sk = f"_dl_{label}"
@@ -831,7 +1280,6 @@ def lazy_download(label, spec, make, file_name, mime):
     if saved and saved[0] == spec:
         st.download_button(f"⬇️ {file_name}", saved[1], file_name=file_name, mime=mime, key=f"_d_{label}")
 
-
 def build_report(names, fdf):
     lat, lon = latlon
     loc = f"<a href='{maps_link(lat, lon)}'>{lat:.5f}, {lon:.5f}</a>" if lat is not None else "–"
@@ -839,11 +1287,12 @@ def build_report(names, fdf):
             "Raster": f"{grid.w} × {grid.h} px", "Auflösung": f"{grid.res:.2f} m",
             "Fläche": f"{grid.w * grid.h * grid.res**2 / 1e4:.1f} ha", "CRS": html.escape(str(crs)),
             "Zentrum (WGS84)": loc}
+    if data.get("density"):
+        info["Punktdichte"] = f"{data['density']:.1f} Punkte/m²"
     rows = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in info.items())
     prow = "".join(f"<tr><th>{k}</th><td>{html.escape(str(S[k]))}</td></tr>" for k in DEFAULTS)
     imgs = "".join(
-        f"<div><h3>{html.escape(n)}</h3><img src='data:image/png;base64,"
-        f"{base64.b64encode(layer_png((models_key, n), layers[n], grid, tuple(S.stretch), S.hide_voids, 1200)).decode()}'>"
+        f"<div><h3>{html.escape(n)}</h3><img src='{data_uri(lpng(layers[n], 1200))}'>"
         f"<p>{html.escape(layers[n].desc)}</p></div>" for n in names)
     ftab = fdf.to_html(index=False, render_links=True) if len(fdf) else "<p>Keine Features erkannt.</p>"
     css = ("body{font-family:Arial,sans-serif;max-width:1100px;margin:auto;padding:20px}"
@@ -857,15 +1306,16 @@ def build_report(names, fdf):
             f"ersetzt keine archäologische Prüfung im Gelände.</i></p>"
             f"<h2>Parameter</h2><table>{prow}</table></body></html>").encode("utf-8")
 
-
 # =============================================================================
 # Sidebar
 # =============================================================================
 with st.sidebar:
-    st.header("⚙️ Parameter")
-    files = st.file_uploader("Dateien (Punktwolke(n) oder ein Raster)", accept_multiple_files=True,
+    st.markdown("## ⚙️ Steuerung")
+    files = st.file_uploader("📂 Dateien (Punktwolke(n) oder ein Raster)", accept_multiple_files=True,
                              type=[e[1:] for e in POINT_EXT + RASTER_EXT],
-                             help="Mehrere LAS/LAZ/XYZ-Kacheln werden zu einem Mosaik zusammengesetzt.")
+                             help="Mehrere LAS/LAZ/XYZ-Kacheln werden zu einem Mosaik zusammengesetzt. "
+                                  "Auf Streamlit Cloud höchstens 2–3 LAZ-Kacheln gleichzeitig – für größere "
+                                  "Gebiete vorher in QGIS ein Bodenmodell (GeoTIFF) erzeugen.")
     with st.expander("💾 Projekt laden"):
         proj = st.file_uploader("Projektdatei (.json)", type=["json"])
         if proj is not None and st.button("Parameter übernehmen"):
@@ -877,59 +1327,82 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Projektdatei ungültig: {e}")
 
-    st.subheader("🌍 Geo-Referenz")
-    st.checkbox("CRS aus Datei verwenden (falls vorhanden)", key="use_file_crs")
-    st.number_input("EPSG-Code (Fallback)", min_value=1, max_value=999999, step=1, key="epsg",
-                    help="25832 = UTM 32N · 25833 = UTM 33N · 2154 = Lambert-93 (IGN) · 2056 = CH LV95")
-    if not PYPROJ_OK:
-        st.warning("'pyproj' fehlt – Karte und Koordinaten deaktiviert.")
+    with st.expander("🌍 Geo-Referenz"):
+        st.checkbox("CRS aus Datei verwenden (falls vorhanden)", key="use_file_crs")
+        st.number_input("EPSG-Code (Fallback)", min_value=1, max_value=999999, step=1, key="epsg",
+                        help="25832 = UTM 32N · 25833 = UTM 33N · 2154 = Lambert-93 (IGN) · 2056 = CH LV95")
+        if not PYPROJ_OK:
+            st.warning("'pyproj' fehlt – Karte und Koordinaten deaktiviert.")
 
-    st.subheader("☁️ Punktwolke → Raster")
-    st.number_input("Auflösung (m)", min_value=0.1, max_value=10.0, step=0.1, key="grid_res")
-    st.selectbox("Aggregation pro Zelle", ["Mittelwert", "Minimum (robuster bei Vegetation)"], key="agg_mode")
-    st.checkbox("Nur Bodenpunkte (Klasse 2)", key="ground_only")
-    st.checkbox("Morphologischer Vegetationsfilter", key="morph_filter",
-                help="Entfernt Zellen, die deutlich über dem lokalen Minimum liegen (Bäume, Gebäude).")
-    st.slider("Filterfenster (m)", 3.0, 50.0, step=1.0, key="morph_window_m", disabled=not S.morph_filter)
-    st.slider("Filterschwelle (m)", 0.2, 5.0, step=0.1, key="morph_threshold_m", disabled=not S.morph_filter)
+    with st.expander("☁️ Punktwolke → Raster"):
+        st.number_input("Auflösung (m)", min_value=0.1, max_value=10.0, step=0.1, key="grid_res",
+                        help="Nicht feiner als die Punktdichte erlaubt – nach dem Laden zeigt die App "
+                             "eine empfohlene Auflösung an.")
+        st.selectbox("Aggregation pro Zelle", ["Mittelwert", "Minimum (robuster bei Vegetation)"], key="agg_mode")
+        st.checkbox("Nur Bodenpunkte (Klasse 2)", key="ground_only")
+        st.checkbox("Morphologischer Vegetationsfilter", key="morph_filter",
+                    help="Entfernt Zellen, die deutlich über dem lokalen Minimum liegen (Bäume, Gebäude).")
+        st.slider("Filterfenster (m)", 3.0, 50.0, step=1.0, key="morph_window_m", disabled=not S.morph_filter)
+        st.slider("Filterschwelle (m)", 0.2, 5.0, step=0.1, key="morph_threshold_m", disabled=not S.morph_filter)
 
-    st.subheader("🏔️ Reliefmodelle")
-    st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth",
-              help="Gilt für Hillshade und für die Lichtrichtung in 3D.")
-    st.slider("Sonnenhöhe (°)", 5, 80, key="hs_altitude", help="Flaches Licht (10–25°) betont feine Wälle.")
-    st.slider("LRM-Glättung σ (m)", 2.0, 60.0, step=1.0, key="lrm_sigma_m")
-    st.checkbox("SVF & Openness berechnen (rechenintensiv)", key="enable_svf")
-    st.slider("Richtungen", 4, 16, key="svf_dirs", disabled=not S.enable_svf)
-    st.slider("Suchradius (m)", 5, 50, key="svf_radius_m", disabled=not S.enable_svf)
+    with st.expander("🏔️ Reliefmodelle", expanded=True):
+        st.slider("Licht-Azimut (°)", 0, 360, step=5, key="hs_azimuth",
+                  help="Gilt für Hillshade und für die Lichtrichtung in 3D.")
+        st.slider("Sonnenhöhe (°)", 5, 80, key="hs_altitude", help="Flaches Licht (10–25°) betont feine Wälle.")
+        st.slider("LRM-Glättung σ (m)", 2.0, 60.0, step=1.0, key="lrm_sigma_m",
+                  help="Klein (5–10) = feine Strukturen · groß (20–40) = Wälle, Terrassen, Hohlwege.")
+        st.checkbox("SVF & Openness berechnen (rechenintensiv)", key="enable_svf")
+        st.slider("Richtungen", 4, 16, key="svf_dirs", disabled=not S.enable_svf)
+        st.slider("Suchradius (m)", 5, 50, key="svf_radius_m", disabled=not S.enable_svf)
 
-    st.subheader("🎨 Anzeige")
-    st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch",
-              help="Enger (z. B. 5–95) = kräftigerer Kontrast. Gilt für 2D, 3D, Karte und Bericht.")
-    st.checkbox("Große Datenlücken ausblenden", key="hide_voids")
-    st.slider("Z-Überhöhung (3D)", 0.5, 10.0, step=0.5, key="z_exag")
-    st.slider("Bildhöhe (px)", 400, 1600, step=50, key="view_height",
-              help="Höhe der interaktiven Ansicht, der Karte und der 3D-Ansicht.")
-    st.slider("Bildauflösung (px)", 800, 3000, step=100, key="view_px",
-              help="Höher = schärfer beim Hineinzoomen, aber langsamer.")
+    with st.expander("🎨 Anzeige"):
+        st.slider("Kontrast (Perzentile)", 0.0, 100.0, step=0.5, key="stretch",
+                  help="Enger (z. B. 5–95) = kräftigerer Kontrast. Gilt für 2D, 3D, Karte und Bericht.")
+        st.checkbox("Große Datenlücken ausblenden", key="hide_voids")
+        st.slider("Z-Überhöhung (3D)", 0.5, 10.0, step=0.5, key="z_exag")
+        st.slider("Bildhöhe (px)", 400, 1600, step=50, key="view_height",
+                  help="Höhe der interaktiven Ansicht, der Karte und der 3D-Ansicht.")
+        st.slider("Bildauflösung (px)", 800, 3000, step=100, key="view_px",
+                  help="Höher = schärfer beim Hineinzoomen, aber langsamer.")
 
-    st.subheader("🔍 Feature-Erkennung")
-    st.checkbox("Lineare Strukturen", key="det_lines")
-    st.slider("Min. Linienlänge (m)", 5.0, 200.0, step=5.0, key="line_min_m", disabled=not S.det_lines)
-    st.checkbox("Hügel & Senken", key="det_blobs")
-    st.slider("Durchmesser (m)", 2.0, 80.0, step=1.0, key="blob_d", disabled=not S.det_blobs)
-    st.slider("Min. Höhe/Tiefe (m)", 0.05, 2.0, step=0.05, key="blob_min_h", disabled=not S.det_blobs)
-    st.checkbox("Ringstrukturen", key="det_rings")
-    st.slider("Ring-Durchmesser (m)", 5.0, 150.0, step=5.0, key="ring_d", disabled=not S.det_rings)
+    with st.expander("🔍 Feature-Erkennung"):
+        st.checkbox("Lineare Strukturen", key="det_lines")
+        st.slider("Min. Linienlänge (m)", 5.0, 200.0, step=5.0, key="line_min_m", disabled=not S.det_lines)
+        st.checkbox("Hügel & Senken", key="det_blobs")
+        st.slider("Durchmesser (m)", 2.0, 80.0, step=1.0, key="blob_d", disabled=not S.det_blobs)
+        st.slider("Min. Höhe/Tiefe (m)", 0.05, 2.0, step=0.05, key="blob_min_h", disabled=not S.det_blobs)
+        st.checkbox("Ringstrukturen", key="det_rings")
+        st.slider("Ring-Durchmesser (m)", 5.0, 150.0, step=5.0, key="ring_d", disabled=not S.det_rings)
 
-
+    st.caption(f"LiDAR Archäologie Pro · Version {APP_VERSION}")
 # =============================================================================
 # Hauptbereich
 # =============================================================================
-st.title("🏛️ LiDAR Archäologie Pro")
+st.markdown("""<div class="app-header"><h1>🏛️ LiDAR Archäologie Pro</h1>
+<p>Reliefanalyse · Prospektion · Flutungssimulation</p></div>""", unsafe_allow_html=True)
+
 if not files:
-    st.info("Bitte eine oder mehrere Punktwolken (.las, .laz, .xyz, .txt, .csv, .ply) "
-            "oder ein Raster (.tif, .asc) hochladen.")
+    cards = [("📂", "1 · Daten laden", "Links in der Sidebar eine LAS/LAZ-Punktwolke oder ein "
+                                      "Höhenmodell (GeoTIFF, ASC) hochladen."),
+             ("🏔️", "2 · Relief erkunden", "Reliefmodelle in 2D, 3D und auf der Karte vergleichen, "
+                                         "Profile ziehen, Strukturen erkennen."),
+             ("🌊", "3 · Flutung simulieren", "Wasserstand verändern, Uferlinien prüfen, Strandlinien suchen "
+                                            "und Ergebnisse exportieren.")]
+    for col, (icon, title, text) in zip(st.columns(3), cards):
+        with col.container(border=True):
+            st.markdown(f"### {icon} {title}")
+            st.write(text)
+    st.info("⬅️ Starte mit einer Datei in der Sidebar.")
     st.stop()
+
+# --- Warnung bei sehr großen Uploads ----------------------------------------------
+total_mb = sum(f.size for f in files) / 1e6
+n_laz = sum(file_ext(f.name) in (".las", ".laz") for f in files)
+if total_mb > BIG_UPLOAD_MB:
+    st.warning(f"⚠️ Sehr große Datenmenge ({total_mb:,.0f} MB in {len(files)} Dateien). Auf Streamlit Cloud "
+               "(ca. 1 GB Arbeitsspeicher) kann die App dabei abstürzen. Besser: höchstens 2–3 LAZ-Kacheln "
+               "gleichzeitig, oder die Kacheln vorher in QGIS zu einem Bodenmodell (GeoTIFF) zusammenfügen."
+               .replace(",", "."))
 
 file_key = tuple(sorted((f.name, f.size) for f in files))
 use_raster = any(file_ext(f.name) in RASTER_EXT for f in files)
@@ -940,6 +1413,9 @@ grid_key = (file_key, pc, morph)
 data = None
 try:
     data = load_grid(grid_key, files)
+except MemoryError:
+    st.error("Zu wenig Arbeitsspeicher. Bitte weniger Kacheln laden, eine gröbere Auflösung wählen "
+             "oder vorher ein Bodenmodell (GeoTIFF) erzeugen.")
 except Exception as e:
     st.error(f"Fehler beim Laden: {e}")
     with st.expander("Technische Details"):
@@ -951,12 +1427,26 @@ grid = GeoGrid(data["z"], data["void"], data["x_min"], data["y_max"], data["res"
 crs = data["crs"] if (S.use_file_crs and data["crs"]) else f"EPSG:{int(S.epsg)}"
 latlon = to_latlon((grid.x_min + grid.x_max) / 2, (grid.y_min + grid.y_max) / 2, crs)
 
-m = st.columns(5)
+density = data.get("density")
+rec = suggest_res(density)
+m = st.columns(6)
 m[0].metric("Quelle", data["source"])
 m[1].metric("Raster", f"{grid.w} × {grid.h}")
 m[2].metric("Auflösung", f"{grid.res:.2f} m")
 m[3].metric("Fläche", f"{grid.w * grid.h * grid.res**2 / 1e4:.1f} ha")
-m[4].metric("CRS", crs if len(str(crs)) < 15 else "WKT")
+m[4].metric("Punktdichte", f"{density:.1f} /m²" if density else "–",
+            f"empfohlen ≥ {rec:.2f} m" if rec else None, delta_color="off")
+m[5].metric("CRS", crs if len(str(crs)) < 15 else "WKT")
+
+if rec and data["source"] == "Punktwolke":
+    if grid.res < rec * 0.9:
+        st.warning(f"🔎 Die Auflösung ({grid.res:.2f} m) ist feiner als die Punktdichte hergibt "
+                   f"({density:.1f} Punkte/m² → empfohlen ≥ {rec:.2f} m). Viele Zellen sind nur aufgefüllt "
+                   "und wirken schärfer, als sie sind.")
+    if abs(float(S.grid_res) - rec) > 0.01:
+        st.button(f"Empfohlene Auflösung {rec:.2f} m übernehmen",
+                  on_click=lambda: S.__setitem__("grid_res", rec))
+
 if latlon[0] is not None:
     st.markdown(f"**📍 Zentrum:** [{latlon[0]:.5f}, {latlon[1]:.5f}]({maps_link(*latlon)})"
                 + (" · CRS aus Datei" if crs == data["crs"] else " · CRS aus Sidebar"))
@@ -965,25 +1455,49 @@ if data["notes"]:
         for n in data["notes"]:
             st.write("• " + n)
 
-models_key = (grid_key, S.hs_azimuth, S.hs_altitude, float(S.lrm_sigma_m), S.enable_svf,
-              S.svf_dirs if S.enable_svf else None, S.svf_radius_m if S.enable_svf else None)
 DET_KEYS = ("det_lines", "line_min_m", "det_blobs", "blob_d", "blob_min_h", "det_rings", "ring_d")
 det_params = {k: S[k] for k in DET_KEYS}
-feat_key = (models_key, tuple((k, tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in det_params.items()))
-
+feat_key = (grid_key, float(S.lrm_sigma_m),
+            tuple((k, tuple(v) if isinstance(v, (list, tuple)) else v) for k, v in det_params.items()))
 
 def current_features():
     d = S.get("features")
     return d["items"] if d and d["key"] == feat_key else []
 
+def set_level(v):
+    """Callback: Wasserstand setzen (auf Geländebereich begrenzt)."""
+    S["water_level"] = float(min(max(v, S["_zmin"]), S["_zmax"]))
+
+def shift_level(d):
+    set_level(S["water_level"] + d)
 
 try:
-    layers, extras = compute_models(models_key, grid.z, grid.res, S.hs_azimuth, S.hs_altitude,
-                                    float(S.lrm_sigma_m), S.enable_svf, S.svf_dirs, S.svf_radius_m)
-    names = list(layers)
+    layers = LazyLayers(grid_key, grid.z, grid.res)
+    names = layers.names
     feats = current_features()
-    t2d, t3d, tmap, tprof, tfeat, texp = st.tabs(
-        ["🖼️ 2D", "🌐 3D", "🗺️ Karte", "📈 Profil", "🔍 Features", "📦 Export"])
+
+    # --- Flutung vorbereiten (wird in Karte, Profil und Tab "Flutung" genutzt) ---
+    zmin, zmax = float(grid.z.min()), float(grid.z.max())
+    if zmax - zmin < 1e-3:
+        zmax = zmin + 1.0
+    S["_zmin"], S["_zmax"] = zmin, zmax
+    wl = S.get("water_level")
+    if wl is None or not (zmin <= wl <= zmax):
+        S["water_level"] = float(min(max(round(zmin + 0.2 * (zmax - zmin), 2), zmin), zmax))
+    cx0, cy0 = (grid.x_min + grid.x_max) / 2, (grid.y_min + grid.y_max) / 2
+    if not (grid.x_min <= S.get("seed_x", -1e18) <= grid.x_max):
+        S["seed_x"] = float(round(cx0, 1))
+    if not (grid.y_min <= S.get("seed_y", -1e18) <= grid.y_max):
+        S["seed_y"] = float(round(cy0, 1))
+    _r, _c = grid.world_to_pixel(S.seed_x, S.seed_y)
+    seed_rc = (int(round(float(_r))), int(round(float(_c))))
+    flood_mode = S.flood_mode if S.flood_mode in FLOOD_MODES else FLOOD_MODES[0]
+    flood_key = (grid_key, round(float(S.water_level), 3), flood_mode,
+                 seed_rc if flood_mode == FLOOD_MODES[2] else None)
+    wet, depth = compute_flood(flood_key, grid.z, float(S.water_level), flood_mode, seed_rc)
+
+    t2d, t3d, tmap, tprof, tfeat, tflood, texp = st.tabs(
+        ["🖼️ 2D", "🌐 3D", "🗺️ Karte", "📈 Profil", "🔍 Features", "🌊 Flutung", "📦 Export"])
 
     # ---------------- 2D ----------------
     with t2d:
@@ -994,14 +1508,13 @@ try:
             cols = st.columns(ncol)
             for i, n in enumerate(names):
                 with cols[i % ncol]:
-                    show_image(layer_png((models_key, n), layers[n], grid, tuple(S.stretch),
-                                         S.hide_voids, 1200), caption=n)
-            st.caption("💡 Mit der Maus über ein Bild fahren → oben rechts erscheint das Vollbild-Symbol.")
+                    show_image(lpng(layers[n], 1200), caption=n)
+            st.caption("💡 Mit der Maus über ein Bild fahren → oben rechts erscheint das Vollbild-Symbol. "
+                       "Die Galerie berechnet alle Modelle – für schnelleres Arbeiten „Einzelbild“ nutzen.")
         elif mode == "Einzelbild":
             sel = st.selectbox("Modell", names, key="sel_single")
             st.caption(layers[sel].desc)
-            show_image(layer_png((models_key, sel), layers[sel], grid, tuple(S.stretch),
-                                 S.hide_voids, int(S.view_px)), caption=sel)
+            show_image(lpng(layers[sel], int(S.view_px)), caption=sel)
         elif mode == "Interaktiv":
             sel = st.selectbox("Modell", names, key="sel2d")
             show_f = st.checkbox(f"Erkannte Features einblenden ({len(feats)})", value=bool(feats))
@@ -1024,14 +1537,14 @@ try:
         shade = c3.slider("Schattierung", 0.0, 1.0, step=0.05, key="shade_3d",
                           help="0 = flach (nur Textur) · 1 = sehr plastisch. Lichtrichtung = Sidebar.")
         s = max(1, math.ceil(math.sqrt(grid.w * grid.h / npts)))
-        zp, tp = grid.z[::s, ::s].copy(), layers[tex].raw[::s, ::s].astype(np.float32, copy=True)
+        TL = layers[tex]
+        zp, tp = grid.z[::s, ::s].copy(), TL.raw[::s, ::s].astype(np.float32, copy=True)
         if S.hide_voids and grid.void.any():
             zp[grid.void[::s, ::s]] = np.nan
         xs, ys = ds_axes(grid, zp.shape, s)
         dx, dy = grid.w * grid.res, grid.h * grid.res
         zr = float(np.nanmax(zp) - np.nanmin(zp)) or 1.0
-        vmin, vmax = vrange(layers[tex], S.stretch)
-        # Lichtrichtung aus Sidebar (Azimut/Sonnenhöhe), Stärke aus Regler "Schattierung"
+        vmin, vmax = vrange(TL, S.stretch)
         az_r, alt_r = math.radians(S.hs_azimuth), math.radians(S.hs_altitude)
         light_pos = dict(x=1e5 * math.sin(az_r) * math.cos(alt_r),
                          y=1e5 * math.cos(az_r) * math.cos(alt_r),
@@ -1039,8 +1552,8 @@ try:
         lighting = dict(ambient=0.9 - 0.6 * shade, diffuse=0.1 + 0.85 * shade,
                         specular=0.05, roughness=0.9, fresnel=0.05)
         fig3d = go.Figure(go.Surface(
-            x=xs, y=ys, z=zp, surfacecolor=tp, colorscale=plotly_cs(layers[tex].cmap), cmin=vmin, cmax=vmax,
-            showscale=bool(layers[tex].unit), lighting=lighting, lightposition=light_pos,
+            x=xs, y=ys, z=zp, surfacecolor=tp, colorscale=plotly_cs(TL.cmap), cmin=vmin, cmax=vmax,
+            showscale=bool(TL.unit), lighting=lighting, lightposition=light_pos,
             hovertemplate="X %{x:.1f} · Y %{y:.1f}<br>Höhe %{z:.2f} m<extra></extra>"))
         fig3d.update_layout(height=int(S.view_height), margin=dict(l=0, r=0, t=30, b=0), title=f"3D: {tex}",
                             scene=dict(aspectmode="manual",
@@ -1063,24 +1576,65 @@ try:
             custom = st.text_input("Eigener XYZ/WMS-Layer (optional, z. B. historische Karte)",
                                    help="XYZ: https://…/{z}/{x}/{y}.png · WMS: GetMap-URL mit "
                                         "BBOX={bbox-epsg-3857}&SRS=EPSG:3857&WIDTH=256&HEIGHT=256")
+            st.markdown(f"**🌊 Wasser auf der Karte** – Wasserstand **{S.water_level:.2f} m** "
+                        "(einstellbar im Tab „Flutung“)")
+            w1, w2 = st.columns(2)
+            w1.checkbox("In der Kachel (LiDAR, genau)", key="map_water_tile")
+            w2.checkbox("In der ganzen Region (grobes Höhenmodell)", key="map_water_region")
+
+            region = None
+            if S.map_water_region:
+                r1, r2, r3 = st.columns(3)
+                r1.slider("Regionsradius (km)", 2, 50, step=1, key="region_km")
+                r2.selectbox("Ausbreitung", REGION_MODES, key="region_mode")
+                r3.checkbox("Höhenversatz zur Kachel ausgleichen", key="region_offset_on",
+                            help="Vergleicht das Regionalmodell mit deinen LiDAR-Daten im Bereich der Kachel "
+                                 "und gleicht den mittleren Höhenunterschied aus.")
+                if not (REQUESTS_OK and PIL_OK):
+                    st.warning("Für das Regionalmodell werden 'requests' und 'Pillow' benötigt.")
+                else:
+                    try:
+                        lat_c, lon_c = round(float(latlon[0]), 4), round(float(latlon[1]), 4)
+                        rkm = int(S.region_km)
+                        off = (regional_offset((grid_key, str(crs), lat_c, lon_c, rkm), grid, crs,
+                                               lat_c, lon_c, rkm) if S.region_offset_on else 0.0)
+                        rmode = S.region_mode if S.region_mode in REGION_MODES else REGION_MODES[0]
+                        sll = to_latlon(S.seed_x, S.seed_y, crs)
+                        seed_ll = ((round(float(sll[1]), 6), round(float(sll[0]), 6))
+                                   if sll[0] is not None else None)
+                        rpng, rb, rarea, rres, rmiss = regional_water(
+                            lat_c, lon_c, rkm, round(float(S.water_level), 2), round(off, 2),
+                            REGION_MODES.index(rmode), seed_ll)
+                        region = dict(png=rpng, bounds=rb, area=rarea, res=rres, offset=off, missing=rmiss)
+                    except Exception as e:
+                        st.warning(f"Regionales Höhenmodell konnte nicht geladen werden: {e}")
+
             cx = [grid.x_min, grid.x_max, grid.x_max, grid.x_min]
             cy = [grid.y_max, grid.y_max, grid.y_min, grid.y_min]
             clat, clon = to_latlon(np.array(cx), np.array(cy), crs)
-            uri = "data:image/png;base64," + base64.b64encode(
-                layer_png((models_key, mlayer), layers[mlayer], grid, tuple(S.stretch),
-                          S.hide_voids, int(S.view_px))).decode()
+            corners = [[float(a), float(b)] for a, b in zip(clon, clat)]
+            uri = data_uri(lpng(layers[mlayer], int(S.view_px)))
             mlayers = []
             if base.startswith("Satellit"):
                 mlayers.append(dict(sourcetype="raster", source=[ESRI_URL], below="traces",
                                     sourceattribution="Esri World Imagery"))
             if custom.strip():
                 mlayers.append(dict(sourcetype="raster", source=[custom.strip()], below="traces"))
-            mlayers.append(dict(sourcetype="image", source=uri, opacity=op, below="traces",
-                                coordinates=[[float(a), float(b)] for a, b in zip(clon, clat)]))
+            if region:
+                lw, ln_, le, ls_ = region["bounds"]
+                mlayers.append(dict(sourcetype="image", source=data_uri(region["png"]),
+                                    opacity=float(S.water_opacity), below="traces",
+                                    coordinates=[[lw, ln_], [le, ln_], [le, ls_], [lw, ls_]]))
+            mlayers.append(dict(sourcetype="image", source=uri, opacity=op, below="traces", coordinates=corners))
+            if S.map_water_tile and wet.any():
+                wuri = data_uri(water_png((flood_key, int(S.view_px), 1.0), wet, depth, int(S.view_px), 1.0))
+                mlayers.append(dict(sourcetype="image", source=wuri, opacity=float(S.water_opacity),
+                                    below="traces", coordinates=corners))
             use_new = hasattr(go, "Scattermap")
             Scatter = go.Scattermap if use_new else go.Scattermapbox
-            fig_m = go.Figure(Scatter(lat=[latlon[0]], lon=[latlon[1]], mode="markers", name="Zentrum",
-                                      marker=dict(size=8, color="black")))
+            fig_m = go.Figure(Scatter(lat=list(clat) + [clat[0]], lon=list(clon) + [clon[0]], mode="lines",
+                                      name="LiDAR-Kachel", line=dict(color="#8b5a2b", width=2),
+                                      hoverinfo="skip"))
             fdf_map = features_df(feats, crs)
             if len(fdf_map) and "Lat" in fdf_map:
                 for label, color in LABEL_COLORS.items():
@@ -1090,12 +1644,25 @@ try:
                                                 marker=dict(size=9, color=color),
                                                 text=[f"#{i} {t} · {g} m" for i, t, g in
                                                       zip(sub["ID"], sub["Typ"], sub["Größe_m"])]))
-            zoom = float(np.clip(math.log2(360 / max(np.ptp(clon), 1e-6)) + 1.5, 1, 19))
+            span = (region["bounds"][2] - region["bounds"][0]) if region else max(np.ptp(clon), 1e-6)
+            zoom = float(np.clip(math.log2(360 / span) + (0.8 if region else 1.5), 1, 19))
             fig_m.update_layout(**{"map" if use_new else "mapbox": dict(
                 style="white-bg" if base != "OpenStreetMap" else "open-street-map",
                 center=dict(lat=latlon[0], lon=latlon[1]), zoom=zoom, layers=mlayers)},
                 height=int(S.view_height), margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h"))
             show_plot(fig_m)
+            if region:
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Überflutet in der Region", f"{region['area']:,.1f} km²".replace(",", "."))
+                k2.metric("Auflösung Regionalmodell", f"≈ {region['res']:.0f} m")
+                k3.metric("Höhenversatz Kachel ↔ Region", f"{region['offset']:+.2f} m")
+                if region["missing"]:
+                    st.warning(f"{region['missing']} Höhenkachel(n) der Region konnten nicht geladen werden – "
+                               "dort ist kein Wasser dargestellt.")
+                st.caption("🌍 Regionalmodell: AWS Terrain Tiles (Mapzen, u. a. SRTM). Grobe Auflösung, "
+                           "Höhenfehler von mehreren Metern möglich, teils mit Bewuchs und Bebauung. Deiche, "
+                           "Dämme und kleine Täler werden nicht erfasst. Innerhalb der Kachel gilt das genauere "
+                           "LiDAR-Wasser (Häkchen „In der Kachel“).")
             st.caption("🖱️ Mausrad = Zoom · Ziehen = Verschieben. Das Overlay wird über seine Eckpunkte "
                        "eingepasst (für Kacheln bis einige km ausreichend genau).")
 
@@ -1108,15 +1675,18 @@ try:
         y0 = c[1].number_input("Start Y", value=float(ym), format="%.1f")
         x1 = c[2].number_input("Ende X", value=float(grid.x_max - grid.res), format="%.1f")
         y1 = c[3].number_input("Ende Y", value=float(ym), format="%.1f")
+        show_w = st.checkbox(f"🌊 Wasserstand einzeichnen ({S.water_level:.2f} m, aus Tab „Flutung“)",
+                             value=True, key="prof_water")
         length = math.hypot(x1 - x0, y1 - y0)
         if length < 2 * grid.res:
             st.warning("Profillinie zu kurz.")
         else:
+            lrm_arr = layers["Restrelief (LRM)"].raw
             n = int(min(5000, max(2, 2 * length / grid.res)))
             px, py = np.linspace(x0, x1, n), np.linspace(y0, y1, n)
             rr, cc = grid.world_to_pixel(px, py)
             zs = ndimage.map_coordinates(grid.z, [rr, cc], order=1, mode="nearest")
-            ls = ndimage.map_coordinates(extras["lrm"], [rr, cc], order=1, mode="nearest")
+            ls = ndimage.map_coordinates(lrm_arr, [rr, cc], order=1, mode="nearest")
             dist = np.linspace(0, length, n)
             a, b = st.columns([1, 2])
             ov = layer_figure("Lage", layers["Hillshade"], grid, max_dim=1000, height=450)
@@ -1125,8 +1695,17 @@ try:
             show_plot(ov, a)
             pf = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.6, 0.4],
                                subplot_titles=("Höhe (m)", "Restrelief (m)"))
-            pf.add_trace(go.Scatter(x=dist, y=zs, mode="lines", name="Höhe"), row=1, col=1)
-            pf.add_trace(go.Scatter(x=dist, y=ls, mode="lines", name="LRM", line=dict(color="firebrick")), row=2, col=1)
+            pf.add_trace(go.Scatter(x=dist, y=zs, mode="lines", name="Höhe", line=dict(color="saddlebrown")),
+                         row=1, col=1)
+            if show_w:
+                ws = ndimage.map_coordinates(wet.astype(np.uint8), [rr, cc], order=0, mode="nearest")
+                yw = np.where(ws > 0, float(S.water_level), np.nan)
+                pf.add_trace(go.Scatter(x=dist, y=yw, mode="lines", fill="tonexty", name="Wasser",
+                                        line=dict(color="royalblue", width=1),
+                                        fillcolor="rgba(65,105,225,0.35)"), row=1, col=1)
+                pf.add_hline(y=float(S.water_level), line_dash="dash", line_color="royalblue", row=1, col=1)
+            pf.add_trace(go.Scatter(x=dist, y=ls, mode="lines", name="LRM", line=dict(color="firebrick")),
+                         row=2, col=1)
             pf.add_hline(y=0, line_dash="dot", row=2, col=1)
             pf.update_layout(height=450, showlegend=False, margin=dict(t=30, b=10), xaxis2_title="Distanz (m)")
             show_plot(pf, b)
@@ -1142,8 +1721,10 @@ try:
             st.caption("Erkennung auf dem Restrelief (LRM). Einstellungen in der Sidebar.")
             if st.button("🔍 Erkennung starten", type="primary"):
                 with st.spinner("Suche Strukturen …"):
+                    bg_slope = c_bg_slope(grid_key, grid.z, grid.res, float(S.lrm_sigma_m))
                     S["features"] = {"key": feat_key,
-                                     "items": detect_features(extras["lrm"], extras["bg_slope"], grid, det_params)}
+                                     "items": detect_features(layers["Restrelief (LRM)"].raw, bg_slope,
+                                                              grid, det_params)}
                 feats = current_features()
             if not feats:
                 st.info("Parameter geändert – bitte Erkennung neu starten." if S.get("features")
@@ -1156,10 +1737,202 @@ try:
                     mc[i].metric(t, int(cnt))
                 fbase = st.selectbox("Hintergrund", names, index=names.index("Restrelief (LRM)"), key="feat_base")
                 show_plot(layer_figure(f"Features auf {fbase}", layers[fbase], grid, feats=feats))
-                st.dataframe(features_df(feats, crs), use_container_width=True, hide_index=True,
-                             column_config={"Google Maps": st.column_config.LinkColumn(display_text="Öffnen")})
+                wide(st.dataframe, features_df(feats, crs), hide_index=True,
+                     column_config={"Google Maps": st.column_config.LinkColumn(display_text="Öffnen")})
                 st.caption("🔴 auffällig · 🟠 möglich · 🔵 unklar – regelbasierte Vorauswahl (Größe, Höhe, "
                            "lokale Hangneigung), keine archäologische Verifikation.")
+
+    # ---------------- Flutung ----------------
+    with tflood:
+        st.caption("🌊 Badewannen-Modell: Alles unterhalb des Wasserstands steht unter Wasser. "
+                   "Keine Strömung, keine Zeit – nur die Frage: *Wo stünde Wasser bei Höhe X?*")
+        rng = zmax - zmin
+        wl_step = 0.01 if rng < 5 else 0.05 if rng < 50 else 0.1 if rng < 500 else 0.5
+        c1, c2 = st.columns([3, 2])
+        c1.slider("Wasserstand (m, Höhenbezug wie in den Daten)", min_value=zmin, max_value=zmax,
+                  step=wl_step, key="water_level", format="%.2f")
+        with c2:
+            st.write("Feineinstellung")
+            bcols = st.columns(4)
+            for i, (lbl, d) in enumerate([("−1 m", -1.0), ("−0,1", -0.1), ("+0,1", 0.1), ("+1 m", 1.0)]):
+                wide(bcols[i].button, lbl, on_click=shift_level, args=(d,), key=f"wl_btn_{i}")
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        c1.radio("Modus", FLOOD_MODES, key="flood_mode",
+                 help="Badewanne: jede tiefe Stelle wird blau. Vom Kachelrand: Wasser kommt nur von außen "
+                      "herein (abgeschlossene Mulden bleiben trocken). Ab Startpunkt: Wasser breitet sich "
+                      "nur von einem Punkt aus (z. B. Flussbett).")
+        c2.selectbox("Hintergrund", names, key="flood_base")
+        c3.slider("Deckkraft Wasser", 0.1, 1.0, step=0.05, key="water_opacity")
+        c4.checkbox("Uferlinie", key="show_shore")
+        if flood_mode == FLOOD_MODES[2]:
+            s1, s2 = st.columns(2)
+            s1.number_input("Startpunkt X", key="seed_x", format="%.1f")
+            s2.number_input("Startpunkt Y", key="seed_y", format="%.1f")
+            st.caption("💡 Koordinaten im Tab 2D → „Interaktiv“ beim Überfahren ablesen.")
+        if S.flood_base not in names:
+            S.flood_base = "Hillshade"
+
+        n_wet = int(wet.sum())
+        area_ha = n_wet * grid.res**2 / 1e4
+        vol = float(depth.sum(dtype=np.float64)) * grid.res**2
+        mc = st.columns(5)
+        mc[0].metric("Wasserstand", f"{S.water_level:.2f} m", f"{S.water_level - zmin:.2f} m über Tiefpunkt",
+                     delta_color="off")
+        mc[1].metric("Überflutete Fläche", f"{area_ha:,.1f} ha".replace(",", "."),
+                     f"{n_wet / wet.size * 100:.1f} % der Kachel", delta_color="off")
+        mc[2].metric("Wasservolumen", fmt_vol(vol))
+        mc[3].metric("Max. Tiefe", f"{float(depth.max()):.2f} m")
+        mc[4].metric("Mittlere Tiefe", f"{float(depth[wet].mean()) if n_wet else 0:.2f} m")
+        if n_wet == 0 and flood_mode == FLOOD_MODES[2]:
+            st.info("Der Startpunkt liegt über dem Wasserstand – nichts geflutet. Wasserstand erhöhen "
+                    "oder Startpunkt in eine Senke legen.")
+
+        lines = shore_lines(flood_key, wet, grid)
+        show_plot(flood_figure(f"Wasserstand {S.water_level:.2f} m", S.flood_base, wet, depth,
+                               lines, S.show_shore, S.view_height))
+        st.caption("🖱️ Mausrad = Zoom · beim Überfahren: Höhe und Wassertiefe · Hellblau = flach, "
+                   "Dunkelblau = tief. 💡 Hintergrund „Restrelief (LRM)“ + Uferlinie zeigt, ob die Uferlinie an "
+                   "Geländekanten (mögliche Terrassen) entlangläuft. Wasser über die ganze Region: Tab „Karte“.")
+
+        with st.expander("📈 Flutkurve – Fläche und Volumen je Wasserstand"):
+            hyp = hypsometry(grid_key, grid.z, grid.res)
+            fh = go.Figure()
+            fh.add_trace(go.Scatter(x=hyp["wasserstand_m"], y=hyp["flaeche_ha"], name="Fläche (ha)",
+                                    line=dict(color="royalblue")))
+            fh.add_trace(go.Scatter(x=hyp["wasserstand_m"], y=hyp["volumen_m3"], name="Volumen (m³)",
+                                    yaxis="y2", line=dict(color="darkorange", dash="dot")))
+            fh.add_vline(x=float(S.water_level), line_dash="dash", line_color="gray")
+            fh.update_layout(height=380, margin=dict(t=30, b=10), xaxis_title="Wasserstand (m)",
+                             yaxis=dict(title="Fläche (ha)"),
+                             yaxis2=dict(title="Volumen (m³)", overlaying="y", side="right"),
+                             legend=dict(orientation="h", y=1.12))
+            show_plot(fh)
+            st.caption("Badewannen-Modell für die ganze Kachel. **Steile Stufen** in der Flächenkurve zeigen "
+                       "Höhen, ab denen große ebene Flächen volllaufen – z. B. Talböden oder Terrassen.")
+
+        with st.expander("🏖️ Strandlinien-Suche – auf welchen Höhen häufen sich Geländekanten?"):
+            st.caption("Stand Wasser lange auf einer Höhe, entstehen oft Uferterrassen oder Brandungskanten – "
+                       "alle auf **derselben Höhe**. Hier wird pro Höhenstufe gezählt, wie oft Hangknicke und "
+                       "ebene Flächen vorkommen, verglichen mit dem Durchschnitt (1,0).")
+            t1, t2 = st.columns([1, 3])
+            run_terr = t1.checkbox("Analyse berechnen", key="terr_on")
+            bin_m = t2.number_input("Höhenschritt (m)", min_value=0.1, max_value=50.0, value=1.0, step=0.5,
+                                    key="terr_bin")
+            if run_terr:
+                tdf = terrace_signal((grid_key, float(bin_m)), grid.z, grid.res, float(bin_m))
+                ft = go.Figure()
+                ft.add_trace(go.Bar(x=tdf["hoehe_m"], y=tdf["kantendichte"], name="Hangknicke (relativ)",
+                                    marker_color="darkorange"))
+                ft.add_trace(go.Scatter(x=tdf["hoehe_m"], y=tdf["ebenen_anteil"], name="Ebene Flächen (relativ)",
+                                        mode="lines", line=dict(color="seagreen")))
+                ft.add_hline(y=1.0, line_dash="dot", line_color="gray")
+                ft.add_vline(x=float(S.water_level), line_dash="dash", line_color="royalblue")
+                ft.update_layout(height=380, margin=dict(t=30, b=10), xaxis_title="Höhe (m)",
+                                 yaxis_title="× Durchschnitt", legend=dict(orientation="h", y=1.12), bargap=0)
+                show_plot(ft)
+                e = tdf["kantendichte"].to_numpy()
+                peaks = [i for i in range(1, len(e) - 1)
+                         if np.isfinite(e[i]) and e[i] >= 1.3 and e[i] >= np.nanmax(e[max(0, i - 2):i + 3])]
+                top = sorted(peaks, key=lambda i: -e[i])[:6]
+                if top:
+                    st.write("**Auffällige Höhen** – Klick setzt den Wasserstand:")
+                    pc_ = st.columns(len(top))
+                    for j, i in enumerate(top):
+                        h = float(tdf["hoehe_m"].iloc[i])
+                        wide(pc_[j].button, f"{h:.1f} m · ×{e[i]:.1f}", on_click=set_level, args=(h,),
+                             key=f"terr_btn_{j}")
+                else:
+                    st.info("Keine deutlich gehäuften Höhen gefunden (Schwelle ×1,3).")
+                st.caption("⚠️ Nur ein Hinweis: Auch Ackerterrassen, Straßen, Bahndämme oder Gesteinsschichten "
+                           "erzeugen Kanten auf gleicher Höhe. Prüfen mit Uferlinie + Restrelief, Profil und "
+                           "Luftbild. Aussagekräftig wird es, wenn dieselbe Höhe in **mehreren Kacheln** auftaucht.")
+
+        with st.expander("🎬 Animation – Wasser steigen lassen"):
+            a1, a2, a3, a4 = st.columns(4)
+            lo = a1.number_input("Von (m)", value=float(round(zmin, 2)), format="%.2f", key="anim_lo")
+            hi = a2.number_input("Bis (m)", value=float(round(zmin + 0.5 * rng, 2)), format="%.2f",
+                                 key="anim_hi")
+            steps = a3.slider("Bilder", 6, 30, 15, key="anim_steps")
+            speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel",
+                                     key="anim_speed")
+            dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
+            spec = (layers.key(S.flood_base), round(lo, 3), round(hi, 3), steps, dur, flood_mode,
+                    seed_rc if flood_mode == FLOOD_MODES[2] else None, float(S.water_opacity),
+                    tuple(S.stretch))
+            if st.button("🎬 Animation erzeugen"):
+                if hi <= lo:
+                    st.warning("„Bis“ muss größer sein als „Von“.")
+                else:
+                    with st.spinner("Erzeuge Animation …"):
+                        S["_flood_anim"] = None
+                        frames = flood_frames(S.flood_base, lo, hi, steps, flood_mode, seed_rc,
+                                              float(S.water_opacity))
+                        S["_flood_anim"] = (spec, frames)
+            anim = S.get("_flood_anim")
+            if anim and anim[0] == spec:
+                show_plot(flood_anim_figure(anim[1], dur))
+                st.caption("▶ Abspielen / ⏸ Pause und der Schieberegler befinden sich **unter dem Bild**. "
+                           "Mit dem Schieberegler kannst du auch Bild für Bild durchgehen.")
+                if PIL_OK:
+                    lazy_download("GIF für Präsentationen erzeugen", spec,
+                                  lambda: frames_to_gif(anim[1], dur), "flutung.gif", "image/gif")
+
+        with st.expander("🌐 3D-Ansicht mit Wasser"):
+            if st.checkbox("3D-Ansicht berechnen", key="flood_3d_on"):
+                FB = layers[S.flood_base]
+                s3 = max(1, math.ceil(math.sqrt(grid.w * grid.h / 200_000)))
+                zp3 = grid.z[::s3, ::s3]
+                tp3 = FB.raw[::s3, ::s3]
+                wz = np.where(wet[::s3, ::s3], float(S.water_level), np.nan)
+                xs3, ys3 = ds_axes(grid, zp3.shape, s3)
+                v0, v1 = vrange(FB, S.stretch)
+                dx3, dy3 = grid.w * grid.res, grid.h * grid.res
+                zr3 = float(zp3.max() - zp3.min()) or 1.0
+                f3 = go.Figure([
+                    go.Surface(x=xs3, y=ys3, z=zp3, surfacecolor=tp3, cmin=v0, cmax=v1, showscale=False,
+                               colorscale=plotly_cs(FB.cmap),
+                               lighting=dict(ambient=0.5, diffuse=0.8, roughness=0.9, specular=0.05),
+                               hovertemplate="Höhe %{z:.2f} m<extra></extra>"),
+                    go.Surface(x=xs3, y=ys3, z=wz, surfacecolor=np.zeros_like(wz), showscale=False,
+                               colorscale=[[0, "#2b6cb0"], [1, "#2b6cb0"]], opacity=0.75,
+                               lighting=dict(ambient=0.7, diffuse=0.3, specular=0.6, roughness=0.3),
+                               hovertemplate="Wasserstand %{z:.2f} m<extra></extra>")])
+                f3.update_layout(height=int(S.view_height), margin=dict(l=0, r=0, t=30, b=0),
+                                 title=f"3D: Wasserstand {S.water_level:.2f} m",
+                                 scene=dict(aspectmode="manual",
+                                            aspectratio=dict(x=1, y=dy3 / dx3, z=max(zr3 / dx3 * S.z_exag, 0.02)),
+                                            xaxis_title="X (m)", yaxis_title="Y (m)", zaxis_title="Höhe (m)"))
+                show_plot(f3)
+
+        with st.expander("📦 Export Flutung"):
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                if RASTERIO_OK:
+                    lazy_download("Wassertiefe als GeoTIFF erzeugen", flood_key,
+                                  lambda: geotiff_bytes(np.where(wet, depth, np.nan), grid, crs),
+                                  f"wassertiefe_{S.water_level:.1f}m.tif", "image/tiff")
+                else:
+                    st.caption("GeoTIFF benötigt 'rasterio'.")
+            with e2:
+                if lines:
+                    props = {"wasserstand_m": round(float(S.water_level), 2), "modus": flood_mode}
+                    if latlon[0] is not None:
+                        st.download_button("⬇️ Uferlinie GeoJSON (WGS84)", lines_geojson(lines, crs, True, props),
+                                           f"uferlinie_{S.water_level:.1f}m_wgs84.geojson", "application/geo+json")
+                    st.download_button("⬇️ Uferlinie GeoJSON (Projekt-CRS)", lines_geojson(lines, crs, False, props),
+                                       f"uferlinie_{S.water_level:.1f}m.geojson", "application/geo+json")
+                else:
+                    st.caption("Keine Uferlinie vorhanden (oder 'scikit-image' fehlt).")
+            with e3:
+                st.download_button("⬇️ Flutkurve (CSV)",
+                                   hypsometry(grid_key, grid.z, grid.res).to_csv(index=False).encode("utf-8"),
+                                   "flutkurve.csv", "text/csv")
+
+        st.info("**Grenzen des Modells:** Das heutige Gelände ist nicht das damalige (Erosion, Ablagerung, "
+                "Landwirtschaft, Bebauung). Höhenbezug prüfen (m ü. NHN vs. Ellipsoidhöhe – Unterschied in "
+                "Deutschland rund 40–50 m). Eine einzelne Kachel zeigt keine regionale Flut. Ein blaues Bild ist "
+                "kein Beleg – aussagekräftig sind nur Geländespuren (Terrassen, Strandwälle, Ablagerungen), die "
+                "zum Wasserstand passen.")
 
     # ---------------- Export ----------------
     with texp:
@@ -1170,16 +1943,16 @@ try:
             c1, c2 = st.columns(2)
             ename = c1.selectbox("Layer", names, key="exp_layer")
             emode = c2.radio("Werte", ["Rohwerte (physikalische Einheit)", "Visualisierung (0–1)"], key="exp_mode")
-            EL = layers[ename]
 
             def make_tif():
+                EL = layers[ename]
                 arr = EL.raw
                 if emode.startswith("Vis"):
-                    lo, hi = vrange(EL, S.stretch)
-                    arr = np.clip((arr - lo) / (hi - lo), 0, 1)
+                    lo_, hi_ = vrange(EL, S.stretch)
+                    arr = np.clip((arr - lo_) / (hi_ - lo_), 0, 1)
                 return geotiff_bytes(arr, grid, crs)
 
-            lazy_download("GeoTIFF erzeugen", (models_key, ename, emode, tuple(S.stretch)), make_tif,
+            lazy_download("GeoTIFF erzeugen", (layers.key(ename), emode, tuple(S.stretch)), make_tif,
                           re.sub(r"[^\w-]+", "_", ename).strip("_") + ".tif", "image/tiff")
 
         st.subheader("Erkannte Features")
@@ -1199,13 +1972,17 @@ try:
         rep = st.multiselect("Modelle im Bericht", names,
                              default=[n for n in ("VAT-ähnliche Fusion", "Restrelief (LRM)", "Hillshade",
                                                   "Hangneigung (Slope)") if n in names])
-        lazy_download("HTML-Bericht erzeugen", (feat_key, tuple(rep), tuple(S.stretch)),
+        lazy_download("HTML-Bericht erzeugen",
+                      (feat_key, tuple(layers.key(n) for n in rep), tuple(S.stretch)),
                       lambda: build_report(rep, features_df(feats, crs)), "lidar_bericht.html", "text/html")
         st.download_button("💾 Projekt speichern (.json)", json.dumps(
-            {"app": "LiDAR Archäologie Pro 2.2", "dateien": [f.name for f in files], "crs": crs,
+            {"app": f"LiDAR Archäologie Pro {APP_VERSION}", "dateien": [f.name for f in files], "crs": crs,
              "parameter": {k: S[k] for k in DEFAULTS}}, ensure_ascii=False, indent=2).encode("utf-8"),
             "lidar_projekt.json", "application/json")
 
+except MemoryError:
+    st.error("Zu wenig Arbeitsspeicher für diese Berechnung. Bitte gröbere Auflösung wählen, SVF ausschalten "
+             "oder einen kleineren Ausschnitt laden.")
 except Exception as e:
     st.error(f"Fehler bei der Analyse: {e}")
     with st.expander("Technische Details"):
