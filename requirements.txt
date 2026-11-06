@@ -3,7 +3,11 @@ numpy
 pandas
 matplotlib
 plotly
-datashader
-rasterio
-cupy-cuda12x
 scipy
+pyproj
+rasterio
+laspy[lazrs]
+plyfile
+scikit-image
+requests
+Pillow
